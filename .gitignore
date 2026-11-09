@@ -1,0 +1,7 @@
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.words.json
+*_cut_report.json
+__pycache__/
