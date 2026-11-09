@@ -36,10 +36,16 @@ import numpy as np
 # 필러(더듬는 말) 사전
 # ----------------------------------------------------------------------------
 # 항상 지우는 필러: 의미가 거의 없는 소리. "어어어", "으음" 같은 반복형도 포함.
-HARD_FILLER_RE = re.compile(r"^(어|음|으|엄|흠|에|읍|uh|um|umm|uhm|er|erm|hmm|mm|ah)+$", re.I)
+HARD_FILLER_RE = re.compile(
+    r"^((어|음|으|엄|흠|에|읍)+"            # 한국어
+    r"|u+h+|u+m+|u+h+m+|e+r+m*|h+m+|m+h*m+)$",  # 영어: uh, uhh, um, umm, uhm, er, erm, hmm, mm, mhm
+    re.I)
 # 앞뒤로 쉼이 있을 때(단독으로 튀어나올 때)만 지우는 필러.
 # "그 사람", "저 책", "아 그렇구나"처럼 실제 의미가 있을 수 있어서 조건부로 처리한다.
-SOFT_FILLERS = {"아", "그", "저", "뭐", "이제", "막", "그니까", "약간", "like", "so", "well"}
+SOFT_FILLERS = {"아", "그", "저", "뭐", "이제", "막", "그니까", "약간",
+                "ah", "ahh", "oh", "like", "so", "well"}
+# 두 단어짜리 조건부 필러 (앞뒤에 쉼이 있을 때만): "..., you know, ..."
+SOFT_PHRASES = {("you", "know"), ("i", "mean")}
 
 _PUNCT_RE = re.compile(r"[\s\.,!?~…·\-\"'“”‘’()\[\]]+")
 
@@ -192,7 +198,10 @@ class Energy:
 # ----------------------------------------------------------------------------
 # Whisper는 기본적으로 "어/음"을 생략하고 깔끔하게 받아 적는 경향이 있다.
 # 필러가 섞인 문장을 프롬프트로 주면 필러도 받아 적게 유도할 수 있다.
-FILLER_PROMPT = "음, 어, 그러니까 어... 이제 음 그 그래서, 으음 오늘은 어 이 부분을 볼 건데요."
+FILLER_PROMPTS = {
+    "ko": "음, 어, 그러니까 어... 이제 음 그 그래서, 으음 오늘은 어 이 부분을 볼 건데요.",
+    "en": "Umm, so, uh, let me think, like, hmm... Okay, uh, so today we're gonna, um, look at this.",
+}
 
 
 def transcribe(wav: str, model_name: str, device: str, compute_type: str, language: str) -> list[Word]:
@@ -206,7 +215,7 @@ def transcribe(wav: str, model_name: str, device: str, compute_type: str, langua
         wav,
         language=language or None,
         word_timestamps=True,
-        initial_prompt=FILLER_PROMPT,
+        initial_prompt=FILLER_PROMPTS.get(language or "", FILLER_PROMPTS["en"]),
         condition_on_previous_text=False,  # 긴 강의에서 환각/반복 방지
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 400, "speech_pad_ms": 150},
@@ -225,6 +234,19 @@ def transcribe(wav: str, model_name: str, device: str, compute_type: str, langua
 # ----------------------------------------------------------------------------
 # 필러 / 더듬기 판정
 # ----------------------------------------------------------------------------
+# "the there", "in into" 처럼 정상적으로 이어지는 영어 단어는 '잘린 앞부분'으로 보지 않는다
+COMMON_EN = set("""a an i to in on at of it is be by do go he me my no or so up us we
+the and for are but not you all can her was one our out his has how its new now see two way who
+did get may any use say she this that with have from they will what when then them some into more
+time like just over also back only well even want here there these those than very much each""".split())
+
+
+def is_fragment_prefix(w: str) -> bool:
+    if re.fullmatch(r"[a-z']+", w):
+        return len(w) >= 3 and w not in COMMON_EN
+    return len(w) <= 3  # 한국어: "프로 프로그램"
+
+
 def mark_disfluencies(words: list[Word], soft_gap: float, use_soft: bool, max_stutter_gap: float):
     n = len(words)
 
@@ -246,6 +268,19 @@ def mark_disfluencies(words: list[Word], soft_gap: float, use_soft: bool, max_st
             stretched = (w.end - w.start) >= 0.55  # "그~~~" 처럼 늘어진 소리
             if isolated or stretched:
                 w.drop = "filler"
+
+    # 1-a) 말하다 끊긴 단어: Whisper는 "prog-", "wh—" 처럼 하이픈으로 적는다
+    for w in words:
+        if not w.drop and re.search(r"[A-Za-z가-힣][-–—]$", w.text.strip()):
+            w.drop = "fragment"
+
+    # 1-b) 두 단어 필러 ("you know", "I mean")
+    if use_soft:
+        for i in range(n - 1):
+            pair = (norm(words[i].text), norm(words[i + 1].text))
+            if pair in SOFT_PHRASES and not words[i].drop and not words[i + 1].drop \
+                    and gap_before(i) >= soft_gap and gap_after(i + 1) >= soft_gap:
+                words[i].drop = words[i + 1].drop = "filler"
 
     # 2) 반복/더듬기: 지우지 않은 단어끼리 비교
     alive = [i for i, w in enumerate(words) if not w.drop]
@@ -269,7 +304,7 @@ def mark_disfluencies(words: list[Word], soft_gap: float, use_soft: bool, max_st
             if g == 1:
                 # 한 단어: 완전히 같거나("그 그"), 잘린 앞부분("프로 프로그램")
                 w0, w1 = a[0], b[0]
-                same = w0 == w1 or (len(w0) < len(w1) and w1.startswith(w0) and len(w0) <= 3)
+                same = w0 == w1 or (len(w0) < len(w1) and w1.startswith(w0) and is_fragment_prefix(w0))
             if same:
                 for j in range(k, k + g):
                     words[alive[j]].drop = "repeat"
@@ -504,7 +539,7 @@ def main():
     g.add_argument("--model", default="small", help="whisper 모델: tiny/base/small/medium/large-v3")
     g.add_argument("--device", default="auto", help="cpu / cuda / auto")
     g.add_argument("--compute-type", default="int8", help="int8(CPU 권장) / float16(GPU 권장)")
-    g.add_argument("--language", default="ko")
+    g.add_argument("--language", default="en", help="강의 언어 (en / ko ...)")
 
     g = p.add_argument_group("더듬기 제거")
     g.add_argument("--no-fillers", action="store_true", help="필러/반복 제거 끄기 (침묵만 정리)")
