@@ -267,6 +267,9 @@ def analyze(src: str, args, status_cb=None) -> bool:
             step = f"음성 인식 {m_[1]}분" + (f" / {total:.0f}분" if total else "")
         if "다시 듣는 중" in line:
             step = "uh/um 다시 듣는 중"
+        m_ = re.search(r"다시 듣기 (\d+)/(\d+)", line)
+        if m_:
+            step = f"uh/um 다시 듣기 {m_[1]}/{m_[2]}"
         if "[화면] 멈춤" in line:
             step = "화면 분석 중"
         if step and time.time() - last_write > 20 and status_cb:

@@ -108,7 +108,8 @@ cat > "$PLIST" <<PLIST
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Background</string>
+  <!-- Background 로 두면 macOS 가 CPU 를 크게 제한해서 음성 인식이 사실상 멈춘다 → Standard -->
+  <key>ProcessType</key><string>Standard</string>
   <key>StandardOutPath</key><string>${LOG}</string>
   <key>StandardErrorPath</key><string>${LOG}</string>
   <key>EnvironmentVariables</key>

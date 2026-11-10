@@ -496,9 +496,10 @@ def classify_untranscribed(chunks: list[Word], samples: np.ndarray, sr: int, mod
     print(f"[필러] 받아쓰기에 없던 소리 {len(chunks)}곳 다시 듣는 중...", flush=True)
     model = WhisperModel(model_name, device=device, compute_type=compute_type, cpu_threads=os.cpu_count() or 4)
     keep_as_speech = []
-    for w in chunks:
+    for k, w in enumerate(chunks, 1):
+        print(f"[필러] 다시 듣기 {k}/{len(chunks)}", flush=True)
         seg = samples[int(max(0, w.start - 0.05) * sr):int((w.end + 0.05) * sr)]
-        segs, _ = model.transcribe(seg, language=language or None, beam_size=5, vad_filter=False,
+        segs, _ = model.transcribe(seg, language=language or None, beam_size=1, vad_filter=False,
                                    condition_on_previous_text=False, initial_prompt="Umm, uh, hmm.")
         segs = list(segs)
         text = " ".join(x.text.strip() for x in segs).strip()
