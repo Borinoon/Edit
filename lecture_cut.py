@@ -45,7 +45,7 @@ HARD_FILLER_RE = re.compile(
 # 앞뒤로 쉼이 있을 때(단독으로 튀어나올 때)만 지우는 필러.
 # "그 사람", "저 책", "아 그렇구나"처럼 실제 의미가 있을 수 있어서 조건부로 처리한다.
 SOFT_FILLERS = {"아", "그", "저", "뭐", "이제", "막", "그니까", "약간",
-                "ah", "ahh", "oh", "like", "so", "well"}
+                "like"}  # "so", "well" 같은 접속어는 말 흐름의 일부라 표시하지 않음
 # 두 단어짜리 조건부 필러 (앞뒤에 쉼이 있을 때만): "..., you know, ..."
 SOFT_PHRASES = {("you", "know"), ("i", "mean")}
 
@@ -258,8 +258,7 @@ def mark_disfluencies(words: list[Word], soft_gap: float, use_soft: bool, max_st
             w.drop = "filler"
         elif use_soft and t in SOFT_FILLERS:
             isolated = gap_before(i) >= soft_gap and gap_after(i) >= soft_gap
-            stretched = (w.end - w.start) >= 0.55  # "그~~~" 처럼 늘어진 소리
-            if isolated or stretched:
+            if isolated:
                 w.drop = "filler"
 
     # 1-a) 말하다 끊긴 단어: Whisper는 "prog-", "wh—" 처럼 하이픈으로 적는다
@@ -496,17 +495,37 @@ def classify_untranscribed(chunks: list[Word], samples: np.ndarray, sr: int, mod
         return
     print(f"[필러] 받아쓰기에 없던 소리 {len(chunks)}곳 다시 듣는 중...", flush=True)
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    keep_as_speech = []
     for w in chunks:
         seg = samples[int(max(0, w.start - 0.05) * sr):int((w.end + 0.05) * sr)]
         segs, _ = model.transcribe(seg, language=language or None, beam_size=5, vad_filter=False,
                                    condition_on_previous_text=False, initial_prompt="Umm, uh, hmm.")
+        segs = list(segs)
         text = " ".join(x.text.strip() for x in segs).strip()
+        no_speech = max((x.no_speech_prob for x in segs), default=1.0)
+        logprob = min((x.avg_logprob for x in segs), default=-9.0)
         toks = [norm(t) for t in re.split(r"[\s,]+", text) if norm(t)]
-        real = [t for t in toks if not HARD_FILLER_RE.match(t) and t not in {"ahem", "ah", "oh", "hm"}]
-        if real and len(text) < 80:  # 너무 긴 결과는 환각("thanks for watching" 등)으로 보고 필러 취급
-            w.drop, w.text = "fragment", f"[다시 말함: {text}]"
+        fillers = [t for t in toks if HARD_FILLER_RE.match(t) or t in NOISE_WORDS]
+        real = [t for t in toks if t not in fillers]
+        if not toks or no_speech >= 0.4 or logprob <= -0.85 or len(text) > 60:
+            # Whisper 가 확신 못 함 → 지어낸 문장일 가능성 큼 (예: "I don't know if you can hear me")
+            # 말로 보지 않음: 라벨 없이 일반 침묵/소리로 처리
+            w.drop = "ignore"
+        elif not real:
+            w.text = f"[{text}]"  # uh, um, 헛기침 → 필러
+        elif all(t in CONNECTIVES for t in real):
+            # "And~", "So~" 처럼 말을 늘인 것 → 정상 발화로 남김 (자르지 않음)
+            w.drop, w.text = "", text
+            keep_as_speech.append(w)
         else:
-            w.text = f"[{text or 'uh/um'}]"
+            w.drop, w.text = "fragment", f"[다시 말함: {text}]"
+    chunks[:] = [w for w in chunks if w.drop != "ignore"]
+
+
+NOISE_WORDS = {"ahem", "cough", "hm", "ah", "oh", "sniff"}
+# 이것만 들렸다면 말을 늘인 것("And~", "So~")으로 보고 자르지 않는다
+CONNECTIVES = {"and", "so", "or", "but", "then", "now", "okay", "ok", "alright", "well", "yes", "yeah", "no",
+               "the", "a", "an", "to", "it", "this", "that", "i", "we", "you", "그리고", "그래서", "이제", "네"}
 
 
 # 말을 정정하는 신호 — 자동으로 자르지는 않고 '확인 필요' 로 표시
@@ -527,11 +546,12 @@ def find_corrections(words: list[Word]) -> list[tuple[float, float, str]]:
 
 
 def detect_noise(samples: np.ndarray, sr: int, energy: "Energy", words: list[Word],
-                 sensitivity: float = 0.0) -> list[tuple[float, float, str]]:
+                 sensitivity: float = 0.0, thump: bool = False) -> list[tuple[float, float, str]]:
     """
     쿵·딸깍·마이크 건드림 같은 순간 노이즈 찾기 (자르지 않고 라벨로만 표시)
       - 날카로운 시작: 2ms 사이에 소리가 급격히 커짐 (클릭, 키보드, 책상 두드림)
       - 저음 충격  : 80Hz 이하 저음이 주변보다 갑자기 커짐 (쿵, 마이크 부딪힘)
+                     ※ 실제 강의 검수 결과 말소리를 잘못 잡는 경우가 많아 기본값은 꺼짐 (--thump 로 켜기)
     말하는 중에는 자음(p, t, k)과 헷갈리지 않도록 기준을 더 엄격하게 둔다.
     sensitivity: +면 더 많이, -면 더 적게 잡음 (dB)
     """
@@ -567,8 +587,8 @@ def detect_noise(samples: np.ndarray, sr: int, energy: "Energy", words: list[Wor
         t = i * 0.002
         in_speech = cov[min(n10 - 1, int(t / hop))]
         if rise[i] >= (22 if in_speech else 15) - sensitivity:
-            hits.append((t, "딸깍/탁 (순간 큰 소리)"))
-    for i in np.nonzero(loudl & (jump >= 12 - sensitivity))[0]:
+            hits.append((t, "키보드·클릭 소리"))
+    for i in (np.nonzero(loudl & (jump >= 12 - sensitivity))[0] if thump else []):
         t = i * hop
         if jump[i] >= (15 if cov[min(n10 - 1, i)] else 12) - sensitivity:
             hits.append((t, "쿵 (저음 충격)"))
@@ -888,6 +908,7 @@ def main():
                    help="영상을 렌더링하지 않고 프리미어용 XML(+컷 목록 CSV)만 만든다")
     g.add_argument("--no-noise", action="store_true", help="쿵·딸깍 같은 노이즈 표시 끄기")
     g.add_argument("--noise-sensitivity", type=float, default=0.0, help="노이즈 감지 민감도(dB). +면 더 많이, -면 덜")
+    g.add_argument("--thump", action="store_true", help="(실험) 쿵 같은 저음 충격도 노이즈로 표시")
     g.add_argument("--auto-cut-xml", action="store_true", help="라벨 표시 XML 외에 실제로 잘라낸 자동컷 XML도 만들기")
     g.add_argument("--source-path", help="원본 영상의 경로 (예: D:/강의/lecture01.mp4). "
                    "저화질 사본으로 분석할 때 XML이 원본을 가리키게 함. 생략 시 프리미어에서 '미디어 연결'로 지정")
@@ -961,10 +982,12 @@ def main():
             if not args.no_fillers and not args.keep_untranscribed:
                 extra = find_untranscribed(words, energy)
                 if extra:
+                    n0 = len(extra)
                     classify_untranscribed(extra, samples, sr, args.model, args.device, args.compute_type,
                                            args.language)
-                    nf = sum(1 for w in extra if w.drop == "fragment")
-                    print(f"[필러] 받아쓰기에 없던 소리 {len(extra)}곳: 필러 {len(extra) - nf}, 다시 말함 {nf}")
+                    classify_counts = {k: sum(1 for w in extra if w.drop == k) for k in ("filler", "fragment", "")}
+                    print(f"[필러] 받아쓰기에 없던 소리 {n0}곳 → 필러 {classify_counts['filler']}, "
+                          f"다시 말함 {classify_counts['fragment']}, 늘인 말(유지) {classify_counts['']}")
                 words = sorted(words + extra, key=lambda w: w.start)
             speech = words_to_speech(words)
 
@@ -1007,7 +1030,8 @@ def main():
 
     if args.premiere:
         cuts = describe_cuts(keep, dur, words, energy)
-        noises = [] if args.no_noise else detect_noise(samples, sr, energy, words, args.noise_sensitivity)
+        noises = [] if args.no_noise else detect_noise(samples, sr, energy, words, args.noise_sensitivity,
+                                                       thump=args.thump)
         if args.source_size:
             w_, h_ = (int(x) for x in args.source_size.lower().split("x"))
         else:
