@@ -216,14 +216,51 @@ def collect(paths) -> list[str]:
     return files
 
 
+def results_dir(src: str, args) -> str:
+    return args.results or os.path.join(os.path.dirname(os.path.abspath(src)), "편집결과")
+
+
+def analyze(src: str, args) -> bool:
+    """원본을 바로 분석해서 프리미어 XML + 컷 목록을 만든다 (사본·업로드 불필요)"""
+    out = results_dir(src, args)
+    stem = os.path.splitext(os.path.basename(src))[0]
+    print(f"\n[자동 편집] {src}\n       결과 폴더: {out}", flush=True)
+    if args.notify:
+        notify("강의 자동 편집 시작", f"{stem} — 30분 강의 기준 10~30분 걸립니다")
+    cmd = [sys.executable, "-u", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lecture_cut.py"),
+           src, "--premiere", "--out-dir", out, "--model", args.model]
+    if not args.no_motion:
+        cmd.append("--keep-silent-motion")
+    t0 = time.time()
+    ok = subprocess.run(cmd).returncode == 0 and os.path.exists(os.path.join(out, stem + "_premiere.xml"))
+    mins = (time.time() - t0) / 60
+    if ok:
+        print(f"[자동 편집 완료] {stem}  ({mins:.0f}분 걸림)", flush=True)
+        if args.notify:
+            notify("강의 자동 편집 완료", f"{stem}_premiere.xml — 프리미어에서 가져오기 하세요")
+    else:
+        print(f"[자동 편집 실패] {stem}", flush=True)
+        if args.notify:
+            notify("강의 자동 편집 실패", f"{stem} — log.txt 를 확인하세요")
+    return ok
+
+
+def is_done(f: str, args) -> bool:
+    if args.analyze:
+        stem = os.path.splitext(os.path.basename(f))[0]
+        return os.path.exists(os.path.join(results_dir(f, args), stem + "_premiere.xml"))
+    return os.path.exists(proxy_paths(f, args.out)[2])
+
+
 def watch(folder: str, args):
-    """폴더 감시: 새 영상이 들어오고 복사가 끝나면(크기 변화 멈춤) 자동 변환"""
-    print(f"[감시] {folder} 에 영상이 들어오면 자동으로 사본을 만듭니다. (종료: Ctrl+C)")
+    """폴더 감시: 새 영상이 들어오고 복사가 끝나면(크기 변화 멈춤) 자동 처리"""
+    what = "프리미어용 자동 편집(XML)을" if args.analyze else "저화질 사본을"
+    print(f"[감시] {folder} 에 영상이 들어오면 자동으로 {what} 만듭니다. (종료: Ctrl+C)", flush=True)
     sizes: dict[str, tuple[int, int]] = {}
+    failed: set[str] = set()
     while True:
         for f in collect([folder]):
-            _, dst, info = proxy_paths(f, args.out)
-            if os.path.exists(info):
+            if f in failed or is_done(f, args):
                 continue
             try:
                 size = os.path.getsize(f)
@@ -233,7 +270,9 @@ def watch(folder: str, args):
             stable = stable + 1 if size == prev else 0
             sizes[f] = (size, stable)
             if stable >= 2:  # 10초 동안 크기 변화 없음 → 복사 완료로 판단
-                make_proxy(f, args)
+                ok = analyze(f, args) if args.analyze else make_proxy(f, args)
+                if not ok:
+                    failed.add(f)  # 실패한 파일은 다시 넣거나 프로그램을 재시작할 때까지 건너뜀
                 sizes.pop(f, None)
         time.sleep(5)
 
@@ -250,6 +289,11 @@ def main():
     p.add_argument("--crf", type=int, default=32, help="화질 (클수록 작고 흐림)")
     p.add_argument("--audio-bitrate", default="96k")
     p.add_argument("--audio-only", action="store_true", help="소리만 저장 (가장 작음, 화면 멈춤 분석 불가)")
+    p.add_argument("--analyze", action="store_true",
+                   help="사본 대신 원본을 바로 분석해 프리미어 XML·컷 목록을 만듦 (lecture_cut.py 실행)")
+    p.add_argument("--results", help="--analyze 결과 폴더 (기본: 원본 옆 '편집결과')")
+    p.add_argument("--model", default="medium", help="--analyze 음성 인식 모델")
+    p.add_argument("--no-motion", action="store_true", help="--analyze 시 말 없이 화면이 움직이는 구간도 자름")
     p.add_argument("--notify", action="store_true", help="완료/실패 시 Mac 알림 표시")
     p.add_argument("--force", action="store_true", help="이미 사본이 있어도 다시 만듦")
     p.add_argument("--pause", action="store_true", help=argparse.SUPPRESS)  # .bat 용: 끝나고 창 유지
@@ -262,7 +306,7 @@ def main():
         files = collect(args.inputs)
         if not files:
             p.print_help()
-        results = [make_proxy(f, args) for f in files]
+        results = [(analyze(f, args) and f) if args.analyze else make_proxy(f, args) for f in files]
         ok = [r for r in results if r]
         if files:
             print(f"\n총 {len(files)}개 중 {len(ok)}개 완료.")

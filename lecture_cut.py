@@ -24,13 +24,15 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, asdict, field
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import make_proxy  # noqa: E402  (ffmpeg 찾기·원본 정보 읽기 공용)
 
 # ----------------------------------------------------------------------------
 # 필러(더듬는 말) 사전
@@ -80,40 +82,27 @@ def run(cmd, **kw):
     return subprocess.run(cmd, check=True, **kw)
 
 
+FFMPEG = "ffmpeg"
+
+
 def probe(path: str) -> dict:
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path],
-        check=True, capture_output=True, text=True,
-    ).stdout
-    info = json.loads(out)
-    v = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
-    a = next((s for s in info["streams"] if s["codec_type"] == "audio"), None)
-    if a is None:
+    """ffprobe 가 있으면 쓰고, 없으면 ffmpeg -i 로그로 (make_proxy.probe 공용)"""
+    m = make_proxy.probe(path)
+    if not m["channels"]:
         sys.exit("오디오 트랙이 없는 파일입니다.")
-    fps = None
-    if v is not None:
-        for key in ("avg_frame_rate", "r_frame_rate"):
-            num, _, den = v.get(key, "0/0").partition("/")
-            try:
-                f = float(num) / float(den)
-                if 1 <= f <= 240:
-                    fps = f
-                    break
-            except (ValueError, ZeroDivisionError):
-                pass
     return {
-        "duration": float(info["format"]["duration"]),
-        "has_video": v is not None,
-        "fps": fps,
-        "sample_rate": int(a.get("sample_rate", 48000)),
-        "channels": int(a.get("channels", 2)),
-        "width": int(v["width"]) if v else 1920,
-        "height": int(v["height"]) if v else 1080,
+        "duration": m["duration"],
+        "has_video": m["width"] is not None,
+        "fps": m["fps"],
+        "sample_rate": m["sample_rate"] or 48000,
+        "channels": m["channels"],
+        "width": m["width"] or 1920,
+        "height": m["height"] or 1080,
     }
 
 
 def extract_audio(path: str, wav: str, sr: int = 16000):
-    run(["ffmpeg", "-v", "error", "-y", "-i", path, "-vn", "-ac", "1", "-ar", str(sr),
+    run([FFMPEG, "-v", "error", "-y", "-i", path, "-vn", "-ac", "1", "-ar", str(sr),
          "-c:a", "pcm_s16le", wav])
 
 
@@ -325,7 +314,7 @@ def mark_disfluencies(words: list[Word], soft_gap: float, use_soft: bool, max_st
 def detect_freeze(path: str, noise_db: float, min_dur: float) -> list[tuple[float, float]]:
     print("[화면] 멈춤 구간 분석 중...", flush=True)
     proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostats", "-i", path, "-an",
+        [FFMPEG, "-hide_banner", "-nostats", "-i", path, "-an",
          "-vf", f"scale=480:-2,freezedetect=n={noise_db}dB:d={min_dur}", "-f", "null", "-"],
         capture_output=True, text=True,
     )
@@ -555,7 +544,7 @@ def render(src: str, dst: str, keep, meta: dict, fps: float | None, args):
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         f.write(";\n".join(parts))
         script = f.name
-    cmd = ["ffmpeg", "-hide_banner", "-y", "-i", src, "-filter_complex_script", script]
+    cmd = [FFMPEG, "-hide_banner", "-y", "-i", src, "-filter_complex_script", script]
     if meta["has_video"]:
         cmd += ["-map", "[v]", "-c:v", args.vcodec, "-preset", args.preset, "-crf", str(args.crf),
                 "-pix_fmt", "yuv420p"]
@@ -706,6 +695,7 @@ def main():
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("input")
     p.add_argument("-o", "--output", help="출력 파일 (기본: 입력이름_cut.mp4)")
+    p.add_argument("--out-dir", help="결과(XML·CSV·리포트·받아쓰기 캐시) 저장 폴더 (기본: 입력 파일 옆)")
     p.add_argument("--dry-run", action="store_true", help="렌더링하지 않고 컷 리포트만 저장")
 
     g = p.add_argument_group("음성 인식")
@@ -758,14 +748,18 @@ def main():
     g.add_argument("--abitrate", default="192k")
     args = p.parse_args()
 
-    for tool in ("ffmpeg", "ffprobe"):
-        if not shutil.which(tool):
-            sys.exit(f"{tool} 를 찾을 수 없습니다. ffmpeg를 설치해 주세요.")
+    global FFMPEG
+    FFMPEG = make_proxy.find_ffmpeg()  # 설치된 ffmpeg, 없으면 imageio-ffmpeg 내장본
+    make_proxy.FFMPEG = FFMPEG
 
     src = args.input
     base = os.path.splitext(src)[0]
+    info_base = base
+    if args.out_dir:
+        os.makedirs(args.out_dir, exist_ok=True)
+        base = os.path.join(args.out_dir, os.path.splitext(os.path.basename(src))[0])
     # make_proxy.py 가 만든 원본 정보가 있으면 프리미어 내보내기 설정을 자동으로 채운다
-    info_path = base + ".info.json"
+    info_path = info_base + ".info.json"
     if os.path.exists(info_path):
         with open(info_path, encoding="utf-8") as f:
             info = json.load(f)

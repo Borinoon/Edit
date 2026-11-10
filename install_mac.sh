@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 강의 사본 자동 변환기 — Mac 설치 스크립트
+# 강의 자동 편집기 — Mac 설치 스크립트
 #
 # 터미널에 아래 한 줄을 붙여넣고 엔터:
 #   curl -fsSL https://raw.githubusercontent.com/Borinoon/Edit/claude/compassionate-darwin-3r1ph6/install_mac.sh | bash
@@ -10,7 +10,7 @@
 #   2. 프로그램을 ~/LectureCut 에 설치하고, 변환 도구(ffmpeg) 준비
 #   3. 감시 폴더 ~/LectureCut/원본 을 만들고 바탕화면에 바로가기 생성
 #   4. 로그인할 때마다 자동으로 폴더 감시 시작 (백그라운드, 창 없음)
-#      → 영상을 폴더에 넣으면 자동 변환되고 완료되면 알림이 뜸
+#      → 영상을 폴더에 넣으면 uh/um·숨소리·침묵을 찾아 프리미어 XML 을 자동 생성, 완료 알림
 # 삭제:  bash ~/LectureCut/app/uninstall_mac.sh
 # =============================================================================
 set -euo pipefail
@@ -65,8 +65,11 @@ chmod +x "$APP"/*.command "$APP"/*.sh 2>/dev/null || true
 echo "변환 도구(ffmpeg) 준비 중..."
 [ -d "$VENV" ] || "$PY" -m venv "$VENV"
 "$VENV/bin/python" -m pip install -q --upgrade pip
-"$VENV/bin/python" -m pip install -q imageio-ffmpeg
+"$VENV/bin/python" -m pip install -q imageio-ffmpeg numpy faster-whisper
 "$VENV/bin/python" -c "import imageio_ffmpeg; imageio_ffmpeg.get_ffmpeg_exe()" || die "ffmpeg 준비 실패"
+echo "음성 인식 모델 받는 중 (약 1.5GB, 처음 한 번만)..."
+"$VENV/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('medium', device='cpu', compute_type='int8')" \
+  || die "음성 인식 모델 다운로드 실패. 인터넷 연결을 확인하고 다시 설치하세요."
 
 # --- 3. 감시 폴더 + 바탕화면 바로가기 ----------------------------------------
 say "3/4 감시 폴더 만들기"
@@ -74,8 +77,9 @@ mkdir -p "$WATCH"
 # 바탕화면에 바로가기 (Finder 에서 이 폴더로 영상을 끌어다 넣으면 됨)
 ln -sfn "$WATCH" "$HOME/Desktop/강의 원본 넣기" 2>/dev/null \
   || echo "(바탕화면 바로가기를 못 만들었습니다. Finder 에서 $WATCH 를 직접 열어 쓰세요)"
-ln -sfn "$WATCH/proxy" "$HOME/Desktop/강의 사본 (올릴 파일)" 2>/dev/null || true
-mkdir -p "$WATCH/proxy"
+mkdir -p "$WATCH/편집결과"
+rm -f "$HOME/Desktop/강의 사본 (올릴 파일)"   # 이전 버전 바로가기 정리
+ln -sfn "$WATCH/편집결과" "$HOME/Desktop/강의 편집결과 (프리미어)" 2>/dev/null || true
 
 # --- 4. 로그인 시 자동 감시 --------------------------------------------------
 say "4/4 자동 감시 등록 (로그인할 때마다 자동 시작)"
@@ -93,6 +97,7 @@ cat > "$PLIST" <<PLIST
     <string>${APP}/make_proxy.py</string>
     <string>--watch</string>
     <string>${WATCH}</string>
+    <string>--analyze</string>
     <string>--notify</string>
   </array>
   <key>RunAtLoad</key><true/>
@@ -114,7 +119,7 @@ else
   echo "자동 감시 등록에 실패했습니다. 대신 $APP/make_proxy.command 를 더블클릭해서 쓰세요."
 fi
 
-osascript -e 'display notification "바탕화면의 \"강의 원본 넣기\" 폴더에 영상을 넣으세요" with title "강의 사본 변환기 설치 완료"' >/dev/null 2>&1 || true
+osascript -e 'display notification "바탕화면의 \"강의 원본 넣기\" 폴더에 영상을 넣으세요" with title "강의 자동 편집기 설치 완료"' >/dev/null 2>&1 || true
 open "$WATCH"
 
 cat <<DONE
@@ -123,9 +128,11 @@ cat <<DONE
  ✅ 설치 완료
 
  사용법
-   1) 바탕화면 "강의 원본 넣기" 폴더에 강의 영상을 넣기
-   2) 잠시 후 알림이 뜨면 바탕화면 "강의 사본 (올릴 파일)" 폴더의
-      *_proxy.mp4 와 *_proxy.info.json 두 파일을 Claude 에게 올리기
+   1) 바탕화면 "강의 원본 넣기" 폴더에 강의 영상을 넣기 (이미 들어있는 영상도 처리됨)
+   2) "자동 편집 완료" 알림이 뜨면 바탕화면 "강의 편집결과 (프리미어)" 폴더의
+      *_premiere.xml 을 프리미어에서 파일 > 가져오기
+      (*_cuts.csv 는 무엇을 잘랐는지 정리한 표)
+   30분 강의 기준 10~30분 걸립니다.
 
  - Mac 을 껐다 켜도 자동으로 감시합니다.
  - 진행 기록: $LOG
