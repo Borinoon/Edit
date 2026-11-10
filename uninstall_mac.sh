@@ -3,6 +3,6 @@
 LABEL="com.lecturecut.watch"
 launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
 rm -f "$HOME/Library/LaunchAgents/${LABEL}.plist"
-rm -f "$HOME/Desktop/강의 원본 넣기" "$HOME/Desktop/강의 사본 (올릴 파일)" "$HOME/Desktop/강의 편집결과 (프리미어)"   # 바로가기만 삭제
+rm -f "$HOME/Desktop/강의 원본 넣기" "$HOME/Desktop/강의 사본 (올릴 파일)" "$HOME/Desktop/강의 편집결과 (프리미어)" "$HOME/Desktop/강의 XML"   # 바로가기만 삭제
 rm -rf "$HOME/LectureCut/app" "$HOME/LectureCut/venv" "$HOME/LectureCut/log.txt"
-echo "삭제했습니다. 영상 파일은 $HOME/LectureCut/원본 에 그대로 남아 있습니다."
+echo "삭제했습니다. 영상($HOME/LectureCut/원본)과 결과($HOME/LectureCut/강의 XML)는 그대로 남아 있습니다."

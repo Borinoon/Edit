@@ -21,6 +21,7 @@ PY_PKG_URL="https://www.python.org/ftp/python/3.12.7/python-3.12.7-macos11.pkg"
 HOME_DIR="$HOME/LectureCut"
 APP="$HOME_DIR/app"
 WATCH="$HOME_DIR/원본"
+RESULTS="$HOME_DIR/강의 XML"
 VENV="$HOME_DIR/venv"
 LABEL="com.lecturecut.watch"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
@@ -77,9 +78,11 @@ mkdir -p "$WATCH"
 # 바탕화면에 바로가기 (Finder 에서 이 폴더로 영상을 끌어다 넣으면 됨)
 ln -sfn "$WATCH" "$HOME/Desktop/강의 원본 넣기" 2>/dev/null \
   || echo "(바탕화면 바로가기를 못 만들었습니다. Finder 에서 $WATCH 를 직접 열어 쓰세요)"
-mkdir -p "$WATCH/편집결과"
-rm -f "$HOME/Desktop/강의 사본 (올릴 파일)"   # 이전 버전 바로가기 정리
-ln -sfn "$WATCH/편집결과" "$HOME/Desktop/강의 편집결과 (프리미어)" 2>/dev/null || true
+mkdir -p "$RESULTS"
+rm -f "$HOME/Desktop/강의 사본 (올릴 파일)" "$HOME/Desktop/강의 편집결과 (프리미어)"   # 이전 버전 바로가기 정리
+# 결과는 ~/LectureCut/강의 XML 에 저장하고 바탕화면에는 바로가기
+# (macOS 는 백그라운드 프로그램이 바탕화면에 직접 쓰는 것을 막기 때문)
+ln -sfn "$RESULTS" "$HOME/Desktop/강의 XML" 2>/dev/null || true
 
 # --- 4. 로그인 시 자동 감시 --------------------------------------------------
 say "4/4 자동 감시 등록 (로그인할 때마다 자동 시작)"
@@ -98,6 +101,8 @@ cat > "$PLIST" <<PLIST
     <string>--watch</string>
     <string>${WATCH}</string>
     <string>--analyze</string>
+    <string>--results</string>
+    <string>${RESULTS}</string>
     <string>--notify</string>
   </array>
   <key>RunAtLoad</key><true/>
@@ -128,10 +133,12 @@ cat <<DONE
  ✅ 설치 완료
 
  사용법
-   1) 바탕화면 "강의 원본 넣기" 폴더에 강의 영상을 넣기 (이미 들어있는 영상도 처리됨)
-   2) "자동 편집 완료" 알림이 뜨면 바탕화면 "강의 편집결과 (프리미어)" 폴더의
-      *_premiere.xml 을 프리미어에서 파일 > 가져오기
-      (*_cuts.csv 는 무엇을 잘랐는지 정리한 표)
+   1) 바탕화면 "강의 원본 넣기" 에 강의 영상이나 영상이 든 폴더를 넣기
+   2) "자동 편집 완료" 알림이 뜨면 바탕화면 "강의 XML" 폴더의
+      *_라벨표시.xml 을 프리미어에서 파일 > 가져오기
+      → 원본 길이 그대로, 잘라낼 후보만 색 라벨 (아무것도 자르지 않음)
+        빨강=말실수·반복  주황=필러(uh/um)  파랑=침묵·숨소리  노랑=확인 필요  초록=노이즈
+      *_컷목록.csv 는 표시한 구간 목록 (엑셀)
    30분 강의 기준 10~30분 걸립니다.
 
  - Mac 을 껐다 켜도 자동으로 감시합니다.

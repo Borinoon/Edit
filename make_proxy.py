@@ -200,15 +200,23 @@ def make_proxy(src: str, args) -> str | None:
     return dst_media
 
 
-def collect(paths) -> list[str]:
+SKIP_DIRS = {PROXY_DIR, "편집결과", "강의 XML"}
+
+
+def collect(paths, recursive: bool = False) -> list[str]:
+    """영상 파일 모으기. recursive 면 하위 폴더까지 (결과·사본·숨김 폴더는 제외)"""
     files = []
     for p in paths:
         if os.path.isdir(p):
-            for name in sorted(os.listdir(p)):
-                full = os.path.join(p, name)
-                if os.path.isfile(full) and os.path.splitext(name)[1].lower() in VIDEO_EXT \
-                        and not os.path.splitext(name)[0].endswith(SUFFIX):
-                    files.append(full)
+            for root, dirs, names in os.walk(p):
+                dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS)
+                for name in sorted(names):
+                    full = os.path.join(root, name)
+                    if not name.startswith(".") and os.path.splitext(name)[1].lower() in VIDEO_EXT \
+                            and not os.path.splitext(name)[0].endswith(SUFFIX):
+                        files.append(full)
+                if not recursive:
+                    break
         elif os.path.isfile(p):
             files.append(p)
         else:
@@ -217,7 +225,14 @@ def collect(paths) -> list[str]:
 
 
 def results_dir(src: str, args) -> str:
-    return args.results or os.path.join(os.path.dirname(os.path.abspath(src)), "편집결과")
+    """결과 폴더. --results 가 있으면 감시 폴더 안의 하위 폴더 구조를 그대로 따라 만든다
+    (예: 원본/3월 강의/01.mp4 → 강의 XML/3월 강의/01_라벨표시.xml)"""
+    src_dir = os.path.dirname(os.path.abspath(src))
+    if not args.results:
+        return os.path.join(src_dir, "편집결과")
+    root = os.path.abspath(args.watch) if args.watch else src_dir
+    rel = os.path.relpath(src_dir, root)
+    return os.path.normpath(os.path.join(args.results, "" if rel.startswith("..") else rel))
 
 
 def analyze(src: str, args) -> bool:
@@ -232,12 +247,12 @@ def analyze(src: str, args) -> bool:
     if not args.no_motion:
         cmd.append("--keep-silent-motion")
     t0 = time.time()
-    ok = subprocess.run(cmd).returncode == 0 and os.path.exists(os.path.join(out, stem + "_premiere.xml"))
+    ok = subprocess.run(cmd).returncode == 0 and os.path.exists(os.path.join(out, stem + "_라벨표시.xml"))
     mins = (time.time() - t0) / 60
     if ok:
         print(f"[자동 편집 완료] {stem}  ({mins:.0f}분 걸림)", flush=True)
         if args.notify:
-            notify("강의 자동 편집 완료", f"{stem}_premiere.xml — 프리미어에서 가져오기 하세요")
+            notify("강의 자동 편집 완료", f"{stem} — 바탕화면 '강의 XML' 폴더를 확인하세요")
     else:
         print(f"[자동 편집 실패] {stem}", flush=True)
         if args.notify:
@@ -248,7 +263,7 @@ def analyze(src: str, args) -> bool:
 def is_done(f: str, args) -> bool:
     if args.analyze:
         stem = os.path.splitext(os.path.basename(f))[0]
-        return os.path.exists(os.path.join(results_dir(f, args), stem + "_premiere.xml"))
+        return os.path.exists(os.path.join(results_dir(f, args), stem + "_라벨표시.xml"))
     return os.path.exists(proxy_paths(f, args.out)[2])
 
 
@@ -259,7 +274,7 @@ def watch(folder: str, args):
     sizes: dict[str, tuple[int, int]] = {}
     failed: set[str] = set()
     while True:
-        for f in collect([folder]):
+        for f in collect([folder], recursive=True):
             if f in failed or is_done(f, args):
                 continue
             try:

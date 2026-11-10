@@ -481,7 +481,104 @@ def find_untranscribed(words: list[Word], energy: "Energy", min_len: float = 0.1
         dur = b - a
         if dur < min_len or (dur < 0.4 and touches(a, b)):
             continue
-        out.append(Word(a, b, "[uh/um 등]", 0.0, "filler"))
+        out.append(Word(a, b, "[uh/um·끊긴말]", 0.0, "filler"))
+    return out
+
+
+def classify_untranscribed(chunks: list[Word], samples: np.ndarray, sr: int, model_name: str,
+                           device: str, compute_type: str, language: str):
+    """받아쓰기에 없던 목소리 구간을 짧게 다시 들어보고 '필러' vs '말실수(다시 말함)' 로 나눈다"""
+    if not chunks:
+        return
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        return
+    print(f"[필러] 받아쓰기에 없던 소리 {len(chunks)}곳 다시 듣는 중...", flush=True)
+    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    for w in chunks:
+        seg = samples[int(max(0, w.start - 0.05) * sr):int((w.end + 0.05) * sr)]
+        segs, _ = model.transcribe(seg, language=language or None, beam_size=5, vad_filter=False,
+                                   condition_on_previous_text=False, initial_prompt="Umm, uh, hmm.")
+        text = " ".join(x.text.strip() for x in segs).strip()
+        toks = [norm(t) for t in re.split(r"[\s,]+", text) if norm(t)]
+        real = [t for t in toks if not HARD_FILLER_RE.match(t) and t not in {"ahem", "ah", "oh", "hm"}]
+        if real and len(text) < 80:  # 너무 긴 결과는 환각("thanks for watching" 등)으로 보고 필러 취급
+            w.drop, w.text = "fragment", f"[다시 말함: {text}]"
+        else:
+            w.text = f"[{text or 'uh/um'}]"
+
+
+# 말을 정정하는 신호 — 자동으로 자르지는 않고 '확인 필요' 로 표시
+CORRECTION_CUES = [("sorry",), ("i'm", "sorry"), ("i", "mean"), ("oops",), ("my", "bad"), ("wait",),
+                   ("excuse", "me"), ("let", "me", "redo"), ("죄송합니다",), ("아니",), ("잠깐",)]
+
+
+def find_corrections(words: list[Word]) -> list[tuple[float, float, str]]:
+    toks = [norm(w.text) for w in words]
+    out = []
+    for i in range(len(words)):
+        for cue in CORRECTION_CUES:
+            if tuple(toks[i:i + len(cue)]) == cue and not words[i].drop:
+                ctx = " ".join(w.text for w in words[max(0, i - 6):i + len(cue) + 4])
+                out.append((words[max(0, i - 6)].start, words[min(len(words) - 1, i + len(cue) + 3)].end, ctx))
+                break
+    return out
+
+
+def detect_noise(samples: np.ndarray, sr: int, energy: "Energy", words: list[Word],
+                 sensitivity: float = 0.0) -> list[tuple[float, float, str]]:
+    """
+    쿵·딸깍·마이크 건드림 같은 순간 노이즈 찾기 (자르지 않고 라벨로만 표시)
+      - 날카로운 시작: 2ms 사이에 소리가 급격히 커짐 (클릭, 키보드, 책상 두드림)
+      - 저음 충격  : 80Hz 이하 저음이 주변보다 갑자기 커짐 (쿵, 마이크 부딪힘)
+    말하는 중에는 자음(p, t, k)과 헷갈리지 않도록 기준을 더 엄격하게 둔다.
+    sensitivity: +면 더 많이, -면 더 적게 잡음 (dB)
+    """
+    from numpy.lib.stride_tricks import sliding_window_view as sw
+    hop = energy.HOP
+    n10 = len(energy.db)
+    cov = np.zeros(n10, bool)
+    for w in words:
+        if not w.drop:
+            cov[int(w.start / hop):int(w.end / hop) + 1] = True
+
+    # 1) 날카로운 시작 (2ms 프레임)
+    h2 = max(1, int(sr * 0.002))
+    n2 = len(samples) // h2
+    db2 = 20 * np.log10(np.sqrt((samples[:n2 * h2].reshape(n2, h2) ** 2).mean(1)) + 1e-9)
+    prevmax = np.max(sw(np.pad(db2, (6, 0), mode="edge")[:-1], 6), axis=1)[:n2]
+    rise = db2 - prevmax
+    loud2 = db2 >= energy.floor + 20
+
+    # 2) 저음 충격 (10ms 프레임, 80Hz 이하)
+    spec = np.fft.rfft(samples)
+    spec[np.fft.rfftfreq(len(samples), 1 / sr) > 80] = 0
+    low = np.fft.irfft(spec, len(samples)).astype(np.float32)
+    h10 = int(sr * hop)
+    nl = min(n10, len(low) // h10)
+    dbl = 20 * np.log10(np.sqrt((low[:nl * h10].reshape(nl, h10) ** 2).mean(1)) + 1e-9)
+    medl = np.median(sw(np.pad(dbl, 30, mode="edge"), 61), axis=1)[:nl]
+    jump = dbl - medl
+    loudl = dbl >= np.median(dbl) + 15
+
+    hits = []
+    for i in np.nonzero(loud2 & (rise >= 15 - sensitivity))[0]:
+        t = i * 0.002
+        in_speech = cov[min(n10 - 1, int(t / hop))]
+        if rise[i] >= (22 if in_speech else 15) - sensitivity:
+            hits.append((t, "딸깍/탁 (순간 큰 소리)"))
+    for i in np.nonzero(loudl & (jump >= 12 - sensitivity))[0]:
+        t = i * hop
+        if jump[i] >= (15 if cov[min(n10 - 1, i)] else 12) - sensitivity:
+            hits.append((t, "쿵 (저음 충격)"))
+    hits.sort()
+    out = []
+    for t, d in hits:
+        if out and t - out[-1][1] < 0.3:
+            out[-1] = (out[-1][0], max(out[-1][1], t + 0.25), out[-1][2] if d in out[-1][2] else out[-1][2] + ", " + d)
+        else:
+            out.append((max(0.0, t - 0.05), t + 0.25, d))
     return out
 
 
@@ -603,62 +700,60 @@ def describe_cuts(keep, duration, words, energy) -> list[dict]:
                 breath = energy is not None and any(energy.has_breath(x, y) for x, y in gaps if y - x > 0.05)
                 kind = "숨소리+침묵" if breath else "침묵"
                 reasons.append(f"{kind} {silence:.1f}초")
-            cuts.append({"start": prev, "end": a, "reason": ", ".join(reasons) or "쉼 정리"})
+            kind = "mistake" if rep else ("filler" if fill else "silence")
+            cuts.append({"start": prev, "end": a, "reason": ", ".join(reasons) or "쉼 정리", "kind": kind})
         prev = b
     return cuts
 
 
-def export_premiere(xml_path, csv_path, keep, cuts, fps, src_path, total_dur, width, height,
-                    channels, sample_rate, seq_name):
+# 검토용 XML 의 클립 라벨 색 (프리미어 라벨 이름) / 마커 앞머리
+KIND_LABEL = {"mistake": "Rose", "filler": "Mango", "silence": "Cerulean", "check": "Yellow", "noise": "Forest"}
+KIND_TAG = {"mistake": "[말실수·반복]", "filler": "[필러]", "silence": "[침묵]", "check": "[확인 필요]",
+            "noise": "[노이즈]"}
+
+
+def _xmeml(xml_path, clips, markers, fps, src_path, total_dur, width, height, channels, sample_rate, seq_name):
+    """
+    clips  : [(src_in_sec, src_out_sec, label_or_None, clip_name)] — 타임라인에 순서대로 붙여 놓음
+    markers: [(timeline_frame, name, comment, duration_frames)]
+    """
     from xml.sax.saxutils import escape as esc
     base, ntsc, real = timebase_of(fps)
     fr = lambda t: int(round(t * real))  # noqa: E731
     rate = f"<rate><timebase>{base}</timebase><ntsc>{'TRUE' if ntsc else 'FALSE'}</ntsc></rate>"
-    name = esc(os.path.basename(src_path))
+    fname = esc(os.path.basename(src_path))
     src_frames = fr(total_dur)
-
-    file_full = f"""<file id="file-1"><name>{name}</name><pathurl>{esc(path_to_url(src_path))}</pathurl>{rate}
+    file_full = f"""<file id="file-1"><name>{fname}</name><pathurl>{esc(path_to_url(src_path))}</pathurl>{rate}
 <duration>{src_frames}</duration><timecode>{rate}<string>00:00:00:00</string><frame>0</frame><displayformat>NDF</displayformat></timecode>
 <media><video><samplecharacteristics>{rate}<width>{width}</width><height>{height}</height></samplecharacteristics></video>
 <audio><samplecharacteristics><depth>16</depth><samplerate>{sample_rate}</samplerate></samplecharacteristics><channelcount>{channels}</channelcount></audio></media></file>"""
 
     v_items, a_items = [], [[] for _ in range(channels)]
-    pos = 0
-    for i, (a, b) in enumerate(keep):
+    pos, idx = 0, 0
+    for a, b, label, cname in clips:
         fin, fout = fr(a), fr(b)
-        length = fout - fin
-        if length <= 0:
+        if fout <= fin:
             continue
-        start, end = pos, pos + length
-        ids = [f"clipitem-v{i}"] + [f"clipitem-a{c}-{i}" for c in range(channels)]
+        idx += 1
+        start, end = pos, pos + fout - fin
+        ids = [f"clipitem-v{idx}"] + [f"clipitem-a{c}-{idx}" for c in range(channels)]
         links = "".join(
             f"<link><linkclipref>{cid}</linkclipref><mediatype>{'video' if k == 0 else 'audio'}</mediatype>"
-            f"<trackindex>{1 if k == 0 else k}</trackindex><clipindex>{i + 1}</clipindex></link>"
+            f"<trackindex>{1 if k == 0 else k}</trackindex><clipindex>{idx}</clipindex></link>"
             for k, cid in enumerate(ids))
-        common = (f"<name>{name}</name><enabled>TRUE</enabled><duration>{src_frames}</duration>{rate}"
+        lab = f"<labels><label2>{label}</label2></labels>" if label else ""
+        common = (f"<name>{esc(cname or fname)}</name><enabled>TRUE</enabled><duration>{src_frames}</duration>{rate}"
                   f"<start>{start}</start><end>{end}</end><in>{fin}</in><out>{fout}</out>")
-        f_el = file_full if i == 0 else '<file id="file-1"/>'
-        v_items.append(f'<clipitem id="{ids[0]}">{common}{f_el}{links}</clipitem>')
+        f_el = file_full if idx == 1 else '<file id="file-1"/>'
+        v_items.append(f'<clipitem id="{ids[0]}">{common}{f_el}{links}{lab}</clipitem>')
         for c in range(channels):
             a_items[c].append(
                 f'<clipitem id="{ids[c + 1]}">{common}<file id="file-1"/>'
-                f"<sourcetrack><mediatype>audio</mediatype><trackindex>{c + 1}</trackindex></sourcetrack>{links}</clipitem>")
+                f"<sourcetrack><mediatype>audio</mediatype><trackindex>{c + 1}</trackindex></sourcetrack>{links}{lab}</clipitem>")
         pos = end
 
-    # 컷 지점마다 시퀀스 마커 (무엇을 잘랐는지 프리미어에서 바로 확인)
-    markers, pos = [], 0
-    cut_iter = iter(cuts)
-    nxt = next(cut_iter, None)
-    for a, b in keep:
-        while nxt is not None and nxt["end"] <= a + 0.005:
-            markers.append(f"<marker><name>{esc(nxt['reason'])}</name><comment>원본 {esc(tc(fr(nxt['start']), base))}"
-                           f" ~ {esc(tc(fr(nxt['end']), base))}</comment><in>{pos}</in><out>-1</out></marker>")
-            nxt = next(cut_iter, None)
-        pos += fr(b) - fr(a)
-    for c in ([nxt] if nxt else []) + list(cut_iter):  # 마지막 말 뒤에 잘린 부분
-        markers.append(f"<marker><name>{esc(c['reason'])}</name><comment>원본 {esc(tc(fr(c['start']), base))}"
-                       f" ~ {esc(tc(fr(c['end']), base))}</comment><in>{pos}</in><out>-1</out></marker>")
-
+    mk = "".join(f"<marker><name>{esc(n)}</name><comment>{esc(cm)}</comment><in>{f0}</in>"
+                 f"<out>{f0 + d if d else -1}</out></marker>" for f0, n, cm, d in markers)
     audio_tracks = "".join(f"<track>{''.join(items)}<outputchannelindex>{c + 1}</outputchannelindex></track>"
                            for c, items in enumerate(a_items))
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -670,20 +765,77 @@ def export_premiere(xml_path, csv_path, keep, cuts, fps, src_path, total_dur, wi
 <track>{''.join(v_items)}</track></video>
 <audio><numOutputChannels>{channels}</numOutputChannels><format><samplecharacteristics><depth>16</depth>
 <samplerate>{sample_rate}</samplerate></samplecharacteristics></format>{audio_tracks}</audio></media>
-{''.join(markers)}</sequence></xmeml>
+{mk}</sequence></xmeml>
 """
     with open(xml_path, "w", encoding="utf-8") as f:
         f.write(xml)
 
-    import csv
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:  # utf-8-sig: 엑셀에서 한글 안 깨짐
-        w = csv.writer(f)
-        w.writerow(["번호", "원본 시작", "원본 끝", "자른 길이(초)", "이유"])
-        for k, c in enumerate(cuts, 1):
-            w.writerow([k, tc(fr(c["start"]), base), tc(fr(c["end"]), base),
-                        f"{c['end'] - c['start']:.2f}", c["reason"]])
 
-# ----------------------------------------------------------------------------
+def export_premiere(paths: dict, keep, cuts, fps, src_path, total_dur, width, height,
+                    channels, sample_rate, title, checks=(), noises=()):
+    """
+    paths: {"label": 라벨 표시 XML, "cut": (선택) 자동컷 XML, "csv": 컷 목록}
+      라벨 표시: 원본 길이 그대로, 아무것도 자르지 않음. 잘라낼 후보 구간만 별도 클립으로 나뉘어 색 라벨.
+                 말실수·반복 = 빨강(Rose) / 필러 = 주황(Mango) / 침묵·숨소리 = 파랑(Cerulean)
+                 확인 필요(말 정정, 자르지 않음) = 노랑(Yellow)
+      자동컷  : 후보를 실제로 뺀 시퀀스 (--auto-cut-xml 일 때만)
+    """
+    base, _, real = timebase_of(fps)
+    fr = lambda t: int(round(t * real))  # noqa: E731
+    common = (fps, src_path, total_dur, width, height, channels, sample_rate)
+    cm = lambda c: f"원본 {tc(fr(c['start']), base)} ~ {tc(fr(c['end']), base)}"  # noqa: E731
+
+    # 1) 라벨 표시 (기본): 원본 전체를 [유지][잘라낼 후보][유지]... 로 쪼개고 후보에만 색 라벨
+    #    정정 신호 구간은 자르지 않는 '확인 필요'(노랑)로 따로 쪼갠다
+    base_clips = [(a, b, None, None) for a, b in keep] + \
+        [(c["start"], c["end"], KIND_LABEL[c["kind"]], f"{KIND_TAG[c['kind']]} {c['reason']}") for c in cuts]
+    # 덮어 칠할 구간: 확인 필요(노랑), 노이즈(초록) — 원래 클립을 그 부분만 쪼개서 색을 바꾼다
+    overlays = sorted([(a, b, KIND_LABEL["check"], "[확인 필요] 말 정정?") for a, b, _ in checks] +
+                      [(a, b, KIND_LABEL["noise"], f"[노이즈] {d}") for a, b, d in noises])
+    seq = []
+    for a, b, lab, name in sorted(base_clips):
+        holes = []
+        for x, y, ol, on in overlays:
+            x, y = max(a, x), min(b, y)
+            if y - x > 0.05 and not any(x < hy and y > hx for hx, hy, _, _ in holes):
+                holes.append((x, y, ol, on))
+        for x, y in subtract(a, b, [(x, y) for x, y, _, _ in holes]):
+            seq.append((x, y, lab, name))
+        seq += holes
+    seq.sort()
+    rmarkers = [(fr(c["start"]), f"{KIND_TAG[c['kind']]} {c['reason']}", cm(c), fr(c["end"]) - fr(c["start"]))
+                for c in cuts if c["kind"] != "silence" or c["end"] - c["start"] >= 1.0]
+    rmarkers += [(fr(a), "[확인 필요] 말 정정?", ctx, fr(b) - fr(a)) for a, b, ctx in checks]
+    rmarkers += [(fr(a), f"[노이즈] {d}", f"원본 {tc(fr(a), base)}", fr(b) - fr(a)) for a, b, d in noises]
+    rmarkers.sort()
+    _xmeml(paths["label"], seq, rmarkers, *common, title + " (라벨 표시)")
+
+    # 2) (선택) 자동컷: 후보를 실제로 뺀 시퀀스
+    if paths.get("cut"):
+        markers, pos, ci = [], 0, 0
+        for a, b in keep:
+            while ci < len(cuts) and cuts[ci]["end"] <= a + 0.005:
+                c = cuts[ci]
+                markers.append((pos, f"{KIND_TAG[c['kind']]} {c['reason']}", cm(c), 0))
+                ci += 1
+            pos += fr(b) - fr(a)
+        for c in cuts[ci:]:
+            markers.append((pos, f"{KIND_TAG[c['kind']]} {c['reason']}", cm(c), 0))
+        _xmeml(paths["cut"], [(a, b, None, None) for a, b in keep], markers, *common, title + " (자동 컷)")
+
+    import csv
+    with open(paths["csv"], "w", encoding="utf-8-sig", newline="") as f:  # utf-8-sig: 엑셀에서 한글 안 깨짐
+        w = csv.writer(f)
+        w.writerow(["번호", "종류", "원본 시작", "원본 끝", "자른 길이(초)", "이유"])
+        for k, c in enumerate(cuts, 1):
+            w.writerow([k, KIND_TAG[c["kind"]].strip("[]"), tc(fr(c["start"]), base), tc(fr(c["end"]), base),
+                        f"{c['end'] - c['start']:.2f}", c["reason"]])
+        for a, b, ctx in checks:
+            w.writerow(["-", "확인 필요(자르지 않음)", tc(fr(a), base), tc(fr(b), base), "", f"말 정정? \"{ctx}\""])
+        for a, b, d in noises:
+            w.writerow(["-", "노이즈(자르지 않음)", tc(fr(a), base), tc(fr(b), base), f"{b - a:.2f}", d])
+
+
 def fmt(t: float) -> str:
     m, s = divmod(t, 60)
     h, m = divmod(m, 60)
@@ -734,6 +886,9 @@ def main():
     g = p.add_argument_group("프리미어 프로로 내보내기 (원본은 그대로, 컷 정보만)")
     g.add_argument("--premiere", action="store_true",
                    help="영상을 렌더링하지 않고 프리미어용 XML(+컷 목록 CSV)만 만든다")
+    g.add_argument("--no-noise", action="store_true", help="쿵·딸깍 같은 노이즈 표시 끄기")
+    g.add_argument("--noise-sensitivity", type=float, default=0.0, help="노이즈 감지 민감도(dB). +면 더 많이, -면 덜")
+    g.add_argument("--auto-cut-xml", action="store_true", help="라벨 표시 XML 외에 실제로 잘라낸 자동컷 XML도 만들기")
     g.add_argument("--source-path", help="원본 영상의 경로 (예: D:/강의/lecture01.mp4). "
                    "저화질 사본으로 분석할 때 XML이 원본을 가리키게 함. 생략 시 프리미어에서 '미디어 연결'로 지정")
     g.add_argument("--timeline-fps", type=float, help="원본 영상 fps (사본의 fps를 낮췄다면 반드시 지정. 예: 29.97)")
@@ -758,6 +913,10 @@ def main():
     if args.out_dir:
         os.makedirs(args.out_dir, exist_ok=True)
         base = os.path.join(args.out_dir, os.path.splitext(os.path.basename(src))[0])
+    work = base
+    if args.out_dir:  # 받아쓰기 캐시·리포트는 숨김 폴더로 (결과 폴더에는 XML·CSV 만 보이게)
+        os.makedirs(os.path.join(args.out_dir, ".작업파일"), exist_ok=True)
+        work = os.path.join(args.out_dir, ".작업파일", os.path.basename(base))
     # make_proxy.py 가 만든 원본 정보가 있으면 프리미어 내보내기 설정을 자동으로 채운다
     info_path = info_base + ".info.json"
     if os.path.exists(info_path):
@@ -788,7 +947,7 @@ def main():
         if args.no_asr:
             speech = [(a, b, False) for a, b in energy.speech_regions()]
         else:
-            cache = base + ".words.json"
+            cache = work + ".words.json"
             if os.path.exists(cache):
                 print(f"[ASR] 캐시 사용: {cache}  (다시 인식하려면 이 파일을 지우세요)")
                 with open(cache, encoding="utf-8") as f:
@@ -802,7 +961,10 @@ def main():
             if not args.no_fillers and not args.keep_untranscribed:
                 extra = find_untranscribed(words, energy)
                 if extra:
-                    print(f"[필러] 받아쓰기에 없는 목소리(uh/um·헛기침 등) {len(extra)}곳 추가 감지")
+                    classify_untranscribed(extra, samples, sr, args.model, args.device, args.compute_type,
+                                           args.language)
+                    nf = sum(1 for w in extra if w.drop == "fragment")
+                    print(f"[필러] 받아쓰기에 없던 소리 {len(extra)}곳: 필러 {len(extra) - nf}, 다시 말함 {nf}")
                 words = sorted(words + extra, key=lambda w: w.start)
             speech = words_to_speech(words)
 
@@ -832,7 +994,7 @@ def main():
         "removed_words": [{"time": fmt(w.start), "text": w.text, "reason": w.drop} for w in removed],
         "keep_segments": [[round(a, 3), round(b, 3)] for a, b in keep],
     }
-    rpath = base + "_cut_report.json"
+    rpath = work + "_cut_report.json"
     with open(rpath, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
 
@@ -845,16 +1007,25 @@ def main():
 
     if args.premiere:
         cuts = describe_cuts(keep, dur, words, energy)
+        noises = [] if args.no_noise else detect_noise(samples, sr, energy, words, args.noise_sensitivity)
         if args.source_size:
             w_, h_ = (int(x) for x in args.source_size.lower().split("x"))
         else:
             w_, h_ = meta["width"], meta["height"]
-        xml_path, csv_path = base + "_premiere.xml", base + "_cuts.csv"
-        export_premiere(xml_path, csv_path, keep, cuts, snap_fps, args.source_path or os.path.abspath(src),
+        paths = {"label": base + "_라벨표시.xml", "csv": base + "_컷목록.csv"}
+        if args.auto_cut_xml:
+            paths["cut"] = base + "_자동컷.xml"
+        export_premiere(paths, keep, cuts, snap_fps, args.source_path or os.path.abspath(src),
                         dur, w_, h_, args.channels or meta["channels"], meta["sample_rate"],
-                        os.path.splitext(os.path.basename(args.source_path or src))[0] + " (자동 컷)")
-        print(f"[프리미어] XML: {xml_path}")
-        print(f"[프리미어] 컷 목록: {csv_path}  ({len(cuts)}개)")
+                        os.path.splitext(os.path.basename(args.source_path or src))[0],
+                        checks=find_corrections(words), noises=noises)
+        kinds = {k: sum(1 for c in cuts if c["kind"] == k) for k in KIND_TAG}
+        print(f"[프리미어] 라벨표시 XML: {paths['label']}  (자르지 않고 색 라벨만)")
+        if paths.get("cut"):
+            print(f"[프리미어] 자동컷 XML  : {paths['cut']}")
+        print(f"           말실수·반복 {kinds['mistake']} / 필러 {kinds['filler']} / 침묵 {kinds['silence']}"
+              f" / 확인 필요(정정) {len(find_corrections(words))} / 노이즈 {len(noises)}")
+        print(f"[프리미어] 컷 목록    : {paths['csv']}  ({len(cuts)}개)")
         return
     if args.dry_run:
         return

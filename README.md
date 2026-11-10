@@ -117,3 +117,26 @@ python lecture_cut.py lecture01_proxy.mp4 --premiere --timeline-fps 29.97 --sour
 
 파일 > 가져오기 > `*_premiere.xml` → 새 시퀀스가 생깁니다. 원본에 연결된 상태라 화질 손실이 없고,
 컷 하나하나를 일반 편집처럼 늘리거나 되살릴 수 있습니다 (리플 트리밍으로 마커 위치 확인하며 검토).
+
+
+## Mac 완전 자동 (추천)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Borinoon/Edit/claude/compassionate-darwin-3r1ph6/install_mac.sh | bash
+```
+
+1. 바탕화면 `강의 원본 넣기` 에 강의 영상(또는 영상이 든 폴더)을 넣기
+2. 완료 알림이 뜨면 바탕화면 `강의 XML` 에서 `*_라벨표시.xml` 을 프리미어로 가져오기
+
+`라벨표시.xml` 은 **아무것도 자르지 않습니다.** 원본 길이 그대로, 잘라낼 후보 구간만 별도 클립으로 나뉘어 색 라벨이 붙습니다.
+
+| 라벨 색 | 의미 |
+|---|---|
+| 빨강 (Rose) | 말실수·반복 (`the the`, 말하다 끊고 다시 말함) |
+| 주황 (Mango) | 필러 (uh, um) |
+| 파랑 (Cerulean) | 침묵·숨소리 (자연스러운 쉼은 남기고 나머지) |
+| 노랑 (Yellow) | 확인 필요 — "sorry, I mean" 같은 말 정정 (후보 아님, 직접 판단) |
+| 초록 (Forest) | 노이즈 — 쿵, 딸깍 (자동 감지, 들어보고 판단) |
+
+프리미어에서 라벨 색으로 선택(클립 우클릭 > 레이블 > 레이블 그룹 선택) 후 리플 삭제하면 한 번에 잘라낼 수 있습니다.
+실제로 잘라낸 버전도 필요하면 `--auto-cut-xml`.
