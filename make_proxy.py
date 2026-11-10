@@ -235,7 +235,7 @@ def results_dir(src: str, args) -> str:
     return os.path.normpath(os.path.join(args.results, "" if rel.startswith("..") else rel))
 
 
-def analyze(src: str, args) -> bool:
+def analyze(src: str, args, status_cb=None) -> bool:
     """원본을 바로 분석해서 프리미어 XML + 컷 목록을 만든다 (사본·업로드 불필요)"""
     out = results_dir(src, args)
     stem = os.path.splitext(os.path.basename(src))[0]
@@ -249,7 +249,31 @@ def analyze(src: str, args) -> bool:
     if sys.platform == "darwin" and shutil.which("caffeinate"):
         cmd = ["caffeinate", "-i"] + cmd  # 처리 중에는 Mac 이 잠자기로 들어가지 않게
     t0 = time.time()
-    ok = subprocess.run(cmd).returncode == 0 and os.path.exists(os.path.join(out, stem + "_라벨표시.xml"))
+    # 진행 단계를 실시간으로 진행상황.txt 에 반영
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="replace", bufsize=1)
+    total = None
+    last_write = 0.0
+    for line in proc.stdout:
+        print(line, end="", flush=True)  # log.txt 에도 그대로
+        step = None
+        m_ = re.search(r"길이 (\d+):(\d+):([\d.]+)", line)
+        if m_ and total is None:
+            total = int(m_[1]) * 60 + int(m_[2]) + float(m_[3]) / 60
+        if "[ASR] 모델 로드" in line:
+            step = "음성 인식 준비 중"
+        m_ = re.search(r"\[ASR\]\s+([\d.]+)분 처리", line)
+        if m_:
+            step = f"음성 인식 {m_[1]}분" + (f" / {total:.0f}분" if total else "")
+        if "다시 듣는 중" in line:
+            step = "uh/um 다시 듣는 중"
+        if "[화면] 멈춤" in line:
+            step = "화면 분석 중"
+        if step and time.time() - last_write > 20 and status_cb:
+            status_cb(f"진행 중 — {step} ({(time.time() - t0) / 60:.0f}분 경과)")
+            last_write = time.time()
+    proc.wait()
+    ok = proc.returncode == 0 and os.path.exists(os.path.join(out, stem + "_라벨표시.xml"))
     mins = (time.time() - t0) / 60
     if ok:
         print(f"[자동 편집 완료] {stem}  ({mins:.0f}분 걸림)", flush=True)
@@ -275,8 +299,11 @@ def write_status(folder: str, args, states: dict[str, str]):
     try:
         os.makedirs(target, exist_ok=True)
         lines = [f"업데이트: {time.strftime('%Y-%m-%d %H:%M:%S')}", ""]
-        order = {"진행 중": 0, "실패": 1, "대기": 2, "완료": 3}
-        for f, st in sorted(states.items(), key=lambda kv: (order.get(kv[1].split()[0], 9), kv[0])):
+        order = ["진행 중", "실패", "대기", "완료"]
+
+        def rank(st):
+            return next((i for i, k in enumerate(order) if st.startswith(k)), 9)
+        for f, st in sorted(states.items(), key=lambda kv: (rank(kv[1]), kv[0])):
             lines.append(f"[{st}] {os.path.relpath(f, folder)}")
         with open(os.path.join(target, "진행상황.txt"), "w", encoding="utf-8") as fp:
             fp.write("\n".join(lines) + "\n")
@@ -324,7 +351,11 @@ def watch(folder: str, args):
         if todo:
             states[todo] = "진행 중"
             write_status(folder, args, states)
-            ok = analyze(todo, args) if args.analyze else make_proxy(todo, args)
+
+            def update(msg, _t=todo, _s=states):
+                _s[_t] = msg
+                write_status(folder, args, _s)
+            ok = analyze(todo, args, update) if args.analyze else make_proxy(todo, args)
             if ok:
                 failed.pop(todo, None)
             else:

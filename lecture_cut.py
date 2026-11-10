@@ -202,7 +202,7 @@ def transcribe(audio, model_name: str, device: str, compute_type: str, language:
     except ImportError:
         sys.exit("faster-whisper가 필요합니다:  pip install faster-whisper   (또는 --no-asr 사용)")
     print(f"[ASR] 모델 로드: {model_name} ({device}/{compute_type})", flush=True)
-    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    model = WhisperModel(model_name, device=device, compute_type=compute_type, cpu_threads=os.cpu_count() or 4)
     # 파일 경로 대신 16kHz float 배열을 넘긴다 (PyAV 버전 차이로 인한 디코딩 오류 회피)
     segments, info = model.transcribe(
         audio,
@@ -219,7 +219,7 @@ def transcribe(audio, model_name: str, device: str, compute_type: str, language:
         for w in seg.words or []:
             if w.end > w.start:
                 words.append(Word(float(w.start), float(w.end), w.word.strip(), float(w.probability)))
-        print(f"\r[ASR] {seg.end / 60:6.1f}분 처리", end="", flush=True)
+        print(f"\r[ASR] {seg.end / 60:6.1f}분 처리", end="\n" if not sys.stdout.isatty() else "", flush=True)
     print()
     return words
 
@@ -494,7 +494,7 @@ def classify_untranscribed(chunks: list[Word], samples: np.ndarray, sr: int, mod
     except ImportError:
         return
     print(f"[필러] 받아쓰기에 없던 소리 {len(chunks)}곳 다시 듣는 중...", flush=True)
-    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    model = WhisperModel(model_name, device=device, compute_type=compute_type, cpu_threads=os.cpu_count() or 4)
     keep_as_speech = []
     for w in chunks:
         seg = samples[int(max(0, w.start - 0.05) * sr):int((w.end + 0.05) * sr)]
