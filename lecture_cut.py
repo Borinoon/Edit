@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, asdict, field
 
 import numpy as np
@@ -196,16 +197,38 @@ FILLER_PROMPTS = {
 }
 
 
-def transcribe(audio, model_name: str, device: str, compute_type: str, language: str) -> list[Word]:
+def transcribe(audio, model_name: str, device: str, compute_type: str, language: str,
+               partial_path: str | None = None, sr: int = 16000) -> list[Word]:
+    """partial_path: 중간 저장 파일. 중간에 끊겨도(재시작·재설치) 다음엔 이어서 인식한다."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         sys.exit("faster-whisper가 필요합니다:  pip install faster-whisper   (또는 --no-asr 사용)")
     print(f"[ASR] 모델 로드: {model_name} ({device}/{compute_type})", flush=True)
     model = WhisperModel(model_name, device=device, compute_type=compute_type, cpu_threads=os.cpu_count() or 4)
+    words: list[Word] = []
+    offset = 0.0
+    if partial_path and os.path.exists(partial_path):
+        try:
+            with open(partial_path, encoding="utf-8") as f:
+                part = json.load(f)
+            words = [Word(**{k: d[k] for k in ("start", "end", "text", "prob")}) for d in part["words"]]
+            offset = float(part["done_until"])
+            print(f"[ASR] 이전에 하던 곳({offset / 60:.1f}분)부터 이어서 인식합니다", flush=True)
+        except (OSError, ValueError, KeyError):
+            words, offset = [], 0.0
+
+    def save_partial(done_until):
+        if not partial_path:
+            return
+        tmp = partial_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"done_until": done_until, "words": [asdict(w) for w in words]}, f, ensure_ascii=False)
+        os.replace(tmp, partial_path)
+
     # 파일 경로 대신 16kHz float 배열을 넘긴다 (PyAV 버전 차이로 인한 디코딩 오류 회피)
     segments, info = model.transcribe(
-        audio,
+        audio[int(offset * sr):],
         language=language or None,
         word_timestamps=True,
         initial_prompt=FILLER_PROMPTS.get(language or "", FILLER_PROMPTS["en"]),
@@ -214,13 +237,18 @@ def transcribe(audio, model_name: str, device: str, compute_type: str, language:
         vad_parameters={"min_silence_duration_ms": 400, "speech_pad_ms": 150},
         beam_size=5,
     )
-    words: list[Word] = []
+    last_save = time.time()
     for seg in segments:
         for w in seg.words or []:
             if w.end > w.start:
-                words.append(Word(float(w.start), float(w.end), w.word.strip(), float(w.probability)))
-        print(f"\r[ASR] {seg.end / 60:6.1f}분 처리", end="\n" if not sys.stdout.isatty() else "", flush=True)
+                words.append(Word(float(w.start) + offset, float(w.end) + offset, w.word.strip(), float(w.probability)))
+        print(f"\r[ASR] {(seg.end + offset) / 60:6.1f}분 처리", end="\n" if not sys.stdout.isatty() else "", flush=True)
+        if time.time() - last_save > 20:
+            save_partial(seg.end + offset)
+            last_save = time.time()
     print()
+    if partial_path and os.path.exists(partial_path):
+        os.remove(partial_path)
     return words
 
 
@@ -976,7 +1004,8 @@ def main():
                 with open(cache, encoding="utf-8") as f:
                     words = [Word(**{k: d[k] for k in ("start", "end", "text", "prob")}) for d in json.load(f)]
             else:
-                words = transcribe(samples, args.model, args.device, args.compute_type, args.language)
+                words = transcribe(samples, args.model, args.device, args.compute_type, args.language,
+                                   partial_path=work + ".words.partial.json", sr=sr)
                 with open(cache, "w", encoding="utf-8") as f:
                     json.dump([asdict(w) for w in words], f, ensure_ascii=False, indent=0)
             if not args.no_fillers:
