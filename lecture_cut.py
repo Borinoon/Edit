@@ -106,6 +106,9 @@ def probe(path: str) -> dict:
         "has_video": v is not None,
         "fps": fps,
         "sample_rate": int(a.get("sample_rate", 48000)),
+        "channels": int(a.get("channels", 2)),
+        "width": int(v["width"]) if v else 1920,
+        "height": int(v["height"]) if v else 1080,
     }
 
 
@@ -520,6 +523,133 @@ def render(src: str, dst: str, keep, meta: dict, fps: float | None, args):
         os.unlink(script)
 
 
+
+# ----------------------------------------------------------------------------
+# 프리미어 프로 내보내기 (FCP7 XML) + 컷 목록 CSV
+# ----------------------------------------------------------------------------
+def timebase_of(fps: float) -> tuple[int, bool, float]:
+    """(timebase, ntsc 여부, 실제 fps). 29.97 → (30, True, 30000/1001)"""
+    for base in (24, 30, 60, 120):
+        ntsc = base * 1000 / 1001
+        if abs(fps - ntsc) < 0.01:
+            return base, True, ntsc
+    return int(round(fps)), False, float(round(fps))
+
+
+def tc(frames: int, base: int) -> str:
+    f = frames % base
+    s = frames // base
+    return f"{s // 3600:02d}:{s // 60 % 60:02d}:{s % 60:02d}:{f:02d}"
+
+
+def path_to_url(p: str) -> str:
+    from urllib.parse import quote
+    p = p.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:/", p):           # Windows: C:/... → file://localhost/C%3a/...
+        p = p[0] + "%3a" + quote(p[2:], safe="/")
+        return "file://localhost/" + p
+    return "file://localhost" + quote(p if p.startswith("/") else "/" + p, safe="/")
+
+
+def describe_cuts(keep, duration, words, energy) -> list[dict]:
+    """잘려나가는 구간마다 이유를 붙인다 (검토용)"""
+    cuts, prev = [], 0.0
+    for a, b in keep + [(duration, duration)]:
+        if a - prev > 0.005:
+            inside = [w for w in words if w.drop and w.start < a and w.end > prev]
+            reasons = []
+            fill = [w.text for w in inside if w.drop == "filler"]
+            rep = [w.text for w in inside if w.drop in ("repeat", "fragment")]
+            if fill:
+                reasons.append("필러: " + " ".join(fill))
+            if rep:
+                reasons.append("반복/끊긴말: " + " ".join(rep))
+            silence = (a - prev) - sum(min(w.end, a) - max(w.start, prev) for w in inside)
+            if silence > 0.3:
+                gaps = subtract(prev, a, [(w.start, w.end) for w in words])
+                breath = energy is not None and any(energy.has_breath(x, y) for x, y in gaps if y - x > 0.05)
+                kind = "숨소리+침묵" if breath else "침묵"
+                reasons.append(f"{kind} {silence:.1f}초")
+            cuts.append({"start": prev, "end": a, "reason": ", ".join(reasons) or "쉼 정리"})
+        prev = b
+    return cuts
+
+
+def export_premiere(xml_path, csv_path, keep, cuts, fps, src_path, total_dur, width, height,
+                    channels, sample_rate, seq_name):
+    from xml.sax.saxutils import escape as esc
+    base, ntsc, real = timebase_of(fps)
+    fr = lambda t: int(round(t * real))  # noqa: E731
+    rate = f"<rate><timebase>{base}</timebase><ntsc>{'TRUE' if ntsc else 'FALSE'}</ntsc></rate>"
+    name = esc(os.path.basename(src_path))
+    src_frames = fr(total_dur)
+
+    file_full = f"""<file id="file-1"><name>{name}</name><pathurl>{esc(path_to_url(src_path))}</pathurl>{rate}
+<duration>{src_frames}</duration><timecode>{rate}<string>00:00:00:00</string><frame>0</frame><displayformat>NDF</displayformat></timecode>
+<media><video><samplecharacteristics>{rate}<width>{width}</width><height>{height}</height></samplecharacteristics></video>
+<audio><samplecharacteristics><depth>16</depth><samplerate>{sample_rate}</samplerate></samplecharacteristics><channelcount>{channels}</channelcount></audio></media></file>"""
+
+    v_items, a_items = [], [[] for _ in range(channels)]
+    pos = 0
+    for i, (a, b) in enumerate(keep):
+        fin, fout = fr(a), fr(b)
+        length = fout - fin
+        if length <= 0:
+            continue
+        start, end = pos, pos + length
+        ids = [f"clipitem-v{i}"] + [f"clipitem-a{c}-{i}" for c in range(channels)]
+        links = "".join(
+            f"<link><linkclipref>{cid}</linkclipref><mediatype>{'video' if k == 0 else 'audio'}</mediatype>"
+            f"<trackindex>{1 if k == 0 else k}</trackindex><clipindex>{i + 1}</clipindex></link>"
+            for k, cid in enumerate(ids))
+        common = (f"<name>{name}</name><enabled>TRUE</enabled><duration>{src_frames}</duration>{rate}"
+                  f"<start>{start}</start><end>{end}</end><in>{fin}</in><out>{fout}</out>")
+        f_el = file_full if i == 0 else '<file id="file-1"/>'
+        v_items.append(f'<clipitem id="{ids[0]}">{common}{f_el}{links}</clipitem>')
+        for c in range(channels):
+            a_items[c].append(
+                f'<clipitem id="{ids[c + 1]}">{common}<file id="file-1"/>'
+                f"<sourcetrack><mediatype>audio</mediatype><trackindex>{c + 1}</trackindex></sourcetrack>{links}</clipitem>")
+        pos = end
+
+    # 컷 지점마다 시퀀스 마커 (무엇을 잘랐는지 프리미어에서 바로 확인)
+    markers, pos = [], 0
+    cut_iter = iter(cuts)
+    nxt = next(cut_iter, None)
+    for a, b in keep:
+        while nxt is not None and nxt["end"] <= a + 0.005:
+            markers.append(f"<marker><name>{esc(nxt['reason'])}</name><comment>원본 {esc(tc(fr(nxt['start']), base))}"
+                           f" ~ {esc(tc(fr(nxt['end']), base))}</comment><in>{pos}</in><out>-1</out></marker>")
+            nxt = next(cut_iter, None)
+        pos += fr(b) - fr(a)
+    for c in ([nxt] if nxt else []) + list(cut_iter):  # 마지막 말 뒤에 잘린 부분
+        markers.append(f"<marker><name>{esc(c['reason'])}</name><comment>원본 {esc(tc(fr(c['start']), base))}"
+                       f" ~ {esc(tc(fr(c['end']), base))}</comment><in>{pos}</in><out>-1</out></marker>")
+
+    audio_tracks = "".join(f"<track>{''.join(items)}<outputchannelindex>{c + 1}</outputchannelindex></track>"
+                           for c, items in enumerate(a_items))
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xmeml>
+<xmeml version="4"><sequence id="sequence-1"><name>{esc(seq_name)}</name><duration>{pos}</duration>{rate}
+<timecode>{rate}<string>00:00:00:00</string><frame>0</frame><displayformat>NDF</displayformat></timecode>
+<media><video><format><samplecharacteristics>{rate}<width>{width}</width><height>{height}</height>
+<pixelaspectratio>square</pixelaspectratio></samplecharacteristics></format>
+<track>{''.join(v_items)}</track></video>
+<audio><numOutputChannels>{channels}</numOutputChannels><format><samplecharacteristics><depth>16</depth>
+<samplerate>{sample_rate}</samplerate></samplecharacteristics></format>{audio_tracks}</audio></media>
+{''.join(markers)}</sequence></xmeml>
+"""
+    with open(xml_path, "w", encoding="utf-8") as f:
+        f.write(xml)
+
+    import csv
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:  # utf-8-sig: 엑셀에서 한글 안 깨짐
+        w = csv.writer(f)
+        w.writerow(["번호", "원본 시작", "원본 끝", "자른 길이(초)", "이유"])
+        for k, c in enumerate(cuts, 1):
+            w.writerow([k, tc(fr(c["start"]), base), tc(fr(c["end"]), base),
+                        f"{c['end'] - c['start']:.2f}", c["reason"]])
+
 # ----------------------------------------------------------------------------
 def fmt(t: float) -> str:
     m, s = divmod(t, 60)
@@ -564,6 +694,15 @@ def main():
     g.add_argument("--freeze-noise", type=float, default=-55.0, help="멈춤 판정 민감도(dB, 높을수록 관대)")
     g.add_argument("--freeze-min", type=float, default=1.0, help="이 시간 이상 변화 없으면 멈춤으로 판정(초)")
     g.add_argument("--min-motion", type=float, default=0.8, help="이보다 짧은 움직임은 무시(초)")
+
+    g = p.add_argument_group("프리미어 프로로 내보내기 (원본은 그대로, 컷 정보만)")
+    g.add_argument("--premiere", action="store_true",
+                   help="영상을 렌더링하지 않고 프리미어용 XML(+컷 목록 CSV)만 만든다")
+    g.add_argument("--source-path", help="원본 영상의 경로 (예: D:/강의/lecture01.mp4). "
+                   "저화질 사본으로 분석할 때 XML이 원본을 가리키게 함. 생략 시 프리미어에서 '미디어 연결'로 지정")
+    g.add_argument("--timeline-fps", type=float, help="원본 영상 fps (사본의 fps를 낮췄다면 반드시 지정. 예: 29.97)")
+    g.add_argument("--source-size", default=None, help="원본 해상도 (예: 1920x1080, 기본: 입력 파일 해상도)")
+    g.add_argument("--channels", type=int, default=None, help="원본 오디오 채널 수 (기본: 입력 파일)")
 
     g = p.add_argument_group("인코딩")
     g.add_argument("--fps", type=float, help="출력 fps (기본: 원본)")
@@ -621,7 +760,10 @@ def main():
             print(f"[화면] 멈춘 구간 {len(freezes)}개, 합계 {fmt(frozen_total)}")
 
     dropped = [(w.start, w.end) for w in words if w.drop]
-    keep = snap(build_plan(speech, dur, energy, args, freezes, dropped), fps if meta["has_video"] else None)
+    snap_fps = args.timeline_fps or (fps if meta["has_video"] else None)
+    if args.premiere and not snap_fps:
+        sys.exit("영상 트랙이 없습니다. --timeline-fps 로 원본 fps를 지정하세요 (예: --timeline-fps 29.97)")
+    keep = snap(build_plan(speech, dur, energy, args, freezes, dropped), snap_fps)
     out_dur = sum(b - a for a, b in keep)
 
     removed = [w for w in words if w.drop]
@@ -645,6 +787,19 @@ def main():
         print(f"       예: {sample}{' ...' if len(removed) > 12 else ''}")
     print(f"       리포트: {rpath}")
 
+    if args.premiere:
+        cuts = describe_cuts(keep, dur, words, energy)
+        if args.source_size:
+            w_, h_ = (int(x) for x in args.source_size.lower().split("x"))
+        else:
+            w_, h_ = meta["width"], meta["height"]
+        xml_path, csv_path = base + "_premiere.xml", base + "_cuts.csv"
+        export_premiere(xml_path, csv_path, keep, cuts, snap_fps, args.source_path or os.path.abspath(src),
+                        dur, w_, h_, args.channels or meta["channels"], meta["sample_rate"],
+                        os.path.splitext(os.path.basename(args.source_path or src))[0] + " (자동 컷)")
+        print(f"[프리미어] XML: {xml_path}")
+        print(f"[프리미어] 컷 목록: {csv_path}  ({len(cuts)}개)")
+        return
     if args.dry_run:
         return
     render(src, dst, keep, meta, fps if meta["has_video"] else None, args)

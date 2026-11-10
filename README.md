@@ -59,3 +59,36 @@ python lecture_cut.py 강의.mp4
 - 작은 목소리가 침묵으로 취급되면 `--speech-db 10` (기본 14)
 - 화면 멈춤이 잘 안 잡히면 `--freeze-noise -45` (높을수록 관대)
 - 필러를 너무 많이/적게 잡으면 리포트의 `removed_words` 를 확인하고 `--no-soft-fillers` 또는 `--soft-gap` 조정
+
+## 프리미어 프로로 편집하기 (원본 화질 그대로)
+
+원본은 업로드하지 않고, **저화질 사본으로 분석 → 원본 컷 정보(XML)만 프리미어로 가져오는** 방식입니다.
+
+### 1. 분석용 저화질 사본 만들기 (원본 PC에서)
+
+시간축만 같으면 되므로 해상도·fps를 크게 낮춰도 됩니다. 1시간 강의 기준 수십 MB 정도로 줄어듭니다.
+
+```bash
+ffmpeg -i lecture01.mp4 -vf "scale=-2:360,fps=5" -c:v libx264 -crf 32 -preset veryfast -c:a aac -b:a 96k -ac 1 lecture01_proxy.mp4
+```
+
+프리미어에서 만들려면: 파일 > 내보내기 > 미디어 → 형식 H.264, 해상도 640×360, 비트레이트 0.5 Mbps, 오디오 AAC 96kbps.
+**앞뒤를 자르지 말고 전체를 그대로** 내보내야 시간이 맞습니다.
+
+### 2. 분석해서 프리미어용 XML 만들기
+
+```bash
+python lecture_cut.py lecture01_proxy.mp4 --premiere --timeline-fps 29.97 --source-size 1920x1080 --source-path "D:/강의/lecture01.mp4"
+```
+
+- `--timeline-fps`: **원본** fps (사본 fps를 낮췄으므로 필수). 원본 정보는 프리미어에서 클립 우클릭 > 속성으로 확인
+- `--source-path`: 원본 영상 위치. 생략하면 프리미어가 가져올 때 "미디어 연결" 창에서 원본을 지정하면 됨
+
+결과물
+- `lecture01_proxy_premiere.xml` — 컷이 적용된 시퀀스. 컷 지점마다 **무엇을 잘랐는지 마커**(예: `필러: um uh`, `숨소리+침묵 2.4초`)가 붙어 있음
+- `lecture01_proxy_cuts.csv` — 잘린 구간 목록(원본 타임코드, 길이, 이유). 엑셀로 열어서 검토
+
+### 3. 프리미어에서 가져오기
+
+파일 > 가져오기 > `*_premiere.xml` → 새 시퀀스가 생깁니다. 원본에 연결된 상태라 화질 손실이 없고,
+컷 하나하나를 일반 편집처럼 늘리거나 되살릴 수 있습니다 (리플 트리밍으로 마커 위치 확인하며 검토).
