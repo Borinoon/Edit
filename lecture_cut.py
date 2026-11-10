@@ -453,6 +453,49 @@ def build_plan(speech: list[tuple[float, float, bool]], duration: float, energy:
     return [(a, b) for a, b in keep if b - a > 0.02]
 
 
+def find_untranscribed(words: list[Word], energy: "Energy", min_len: float = 0.15) -> list[Word]:
+    """
+    Whisper 는 uh/um, 헛기침, 웅얼거림을 받아쓰기에서 빼 버리는 경향이 강하다.
+    → '목소리 크기의 소리가 나는데 어떤 단어에도 속하지 않는 구간'을 필러로 본다.
+    단어 바로 앞뒤에 붙은 짧은 소리는 단어 끝/시작이 덜 잡힌 것일 수 있어 제외한다.
+    """
+    hop = energy.HOP
+    loud = energy.db >= energy.speech_thr
+    cov = np.zeros(len(loud), bool)
+    for w in words:
+        cov[int(w.start / hop):int(w.end / hop) + 1] = True
+    un = loud & ~cov
+    chunks, st = [], None
+    for i, v in enumerate(np.append(un, False)):
+        if v and st is None:
+            st = i
+        elif not v and st is not None:
+            a, b = st * hop, i * hop
+            if chunks and a - chunks[-1][1] < 0.1:
+                chunks[-1][1] = b
+            else:
+                chunks.append([a, b])
+            st = None
+    starts = sorted(w.start for w in words)
+    ends = sorted(w.end for w in words)
+    import bisect
+
+    def touches(a, b):
+        i = bisect.bisect_left(ends, a - 0.06)
+        after_word = i < len(ends) and ends[i] <= a + 0.02
+        j = bisect.bisect_left(starts, b - 0.02)
+        before_word = j < len(starts) and starts[j] <= b + 0.06
+        return after_word or before_word
+
+    out = []
+    for a, b in chunks:
+        dur = b - a
+        if dur < min_len or (dur < 0.4 and touches(a, b)):
+            continue
+        out.append(Word(a, b, "[uh/um 등]", 0.0, "filler"))
+    return out
+
+
 def words_to_speech(words: list[Word]) -> list[tuple[float, float, bool]]:
     """남길 단어들을 '말 덩어리'로 묶는다. 지운 단어 자리는 덩어리를 끊는다."""
     chunks = []
@@ -676,6 +719,8 @@ def main():
     g.add_argument("--no-fillers", action="store_true", help="필러/반복 제거 끄기 (침묵만 정리)")
     g.add_argument("--no-soft-fillers", action="store_true", help="'그/저/아/뭐/이제' 같은 조건부 필러는 지우지 않음")
     g.add_argument("--soft-gap", type=float, default=0.25, help="조건부 필러로 판정할 앞뒤 쉼(초)")
+    g.add_argument("--keep-untranscribed", action="store_true",
+                   help="받아쓰기에 없는 목소리 구간(대개 uh/um)을 지우지 않음")
     g.add_argument("--max-stutter-gap", type=float, default=0.6, help="이 간격 이내 반복만 더듬기로 판정(초)")
 
     g = p.add_argument_group("자연스러운 쉼 (값이 클수록 여유 있게)")
@@ -760,6 +805,11 @@ def main():
                     json.dump([asdict(w) for w in words], f, ensure_ascii=False, indent=0)
             if not args.no_fillers:
                 mark_disfluencies(words, args.soft_gap, not args.no_soft_fillers, args.max_stutter_gap)
+            if not args.no_fillers and not args.keep_untranscribed:
+                extra = find_untranscribed(words, energy)
+                if extra:
+                    print(f"[필러] 받아쓰기에 없는 목소리(uh/um·헛기침 등) {len(extra)}곳 추가 감지")
+                words = sorted(words + extra, key=lambda w: w.start)
             speech = words_to_speech(words)
 
     freezes = None
