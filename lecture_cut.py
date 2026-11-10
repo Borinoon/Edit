@@ -718,6 +718,17 @@ def main():
 
     src = args.input
     base = os.path.splitext(src)[0]
+    # make_proxy.py 가 만든 원본 정보가 있으면 프리미어 내보내기 설정을 자동으로 채운다
+    info_path = base + ".info.json"
+    if os.path.exists(info_path):
+        with open(info_path, encoding="utf-8") as f:
+            info = json.load(f)
+        args.source_path = args.source_path or info.get("source_path")
+        args.timeline_fps = args.timeline_fps or info.get("source_fps")
+        if not args.source_size and info.get("source_width"):
+            args.source_size = f"{info['source_width']}x{info['source_height']}"
+        args.channels = args.channels or info.get("source_channels")
+        print(f"[원본 정보] {info_path} → {args.source_path}, {args.timeline_fps}fps, {args.source_size}")
     dst = args.output or base + "_cut.mp4"
     meta = probe(src)
     fps = args.fps or meta["fps"]

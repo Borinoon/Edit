@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""
+make_proxy.py — 분석용 저화질 사본(프록시) 자동 생성기
+
+원본 강의 영상을 넣으면 업로드하기 쉬운 작은 사본을 만듭니다.
+  - 360p, 5fps, 모노 오디오 → 1시간 강의 기준 수십 MB
+  - 시간축은 원본과 100% 동일 (앞뒤를 자르지 않음) → 분석 결과를 원본에 그대로 적용 가능
+  - 원본 정보(fps·해상도·채널·경로)를 <사본>.info.json 에 같이 저장
+    → lecture_cut.py 가 자동으로 읽어서 프리미어 XML을 원본 기준으로 만든다
+
+사용법
+  python make_proxy.py 강의.mp4                 # 파일 하나
+  python make_proxy.py 강의1.mp4 강의2.mov      # 여러 개
+  python make_proxy.py D:/강의폴더              # 폴더 안의 영상 전부
+  python make_proxy.py --watch D:/강의폴더      # 폴더 감시: 새 영상이 들어오면 자동 변환
+  Windows: 영상 파일을 make_proxy.bat 아이콘 위로 끌어다 놓기
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VIDEO_EXT = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".wmv", ".mts", ".m2ts", ".webm", ".flv"}
+PROXY_DIR = "proxy"
+SUFFIX = "_proxy"
+
+
+# ----------------------------------------------------------------------------
+# ffmpeg 찾기: 설치된 것 → 없으면 pip 패키지 imageio-ffmpeg 에 들어있는 것
+# ----------------------------------------------------------------------------
+def find_ffmpeg() -> str:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        pass
+    sys.exit("ffmpeg 를 찾을 수 없습니다.\n"
+             "  가장 쉬운 방법:  pip install imageio-ffmpeg\n"
+             "  또는 직접 설치:  Windows → winget install ffmpeg   /   Mac → brew install ffmpeg")
+
+
+FFMPEG = None
+
+
+def probe(path: str) -> dict:
+    """원본 정보. ffprobe 가 있으면 쓰고, 없으면 ffmpeg -i 출력에서 읽는다."""
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        out = subprocess.run([ffprobe, "-v", "error", "-print_format", "json", "-show_streams",
+                              "-show_format", path], capture_output=True, text=True, encoding="utf-8")
+        if out.returncode == 0:
+            info = json.loads(out.stdout)
+            v = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
+            a = next((s for s in info["streams"] if s["codec_type"] == "audio"), None)
+            fps = None
+            if v:
+                for key in ("avg_frame_rate", "r_frame_rate"):
+                    num, _, den = v.get(key, "0/0").partition("/")
+                    try:
+                        f = float(num) / float(den)
+                        if 1 <= f <= 240:
+                            fps = f
+                            break
+                    except (ValueError, ZeroDivisionError):
+                        pass
+            return {
+                "duration": float(info["format"].get("duration", 0)),
+                "fps": round(fps, 3) if fps else None,
+                "width": int(v["width"]) if v else None,
+                "height": int(v["height"]) if v else None,
+                "channels": int(a.get("channels", 2)) if a else 0,
+                "sample_rate": int(a.get("sample_rate", 48000)) if a else None,
+            }
+    # ffprobe 없음 → ffmpeg -i 로그 파싱
+    err = subprocess.run([FFMPEG, "-hide_banner", "-i", path], capture_output=True, text=True,
+                         encoding="utf-8", errors="replace").stderr
+    d = re.search(r"Duration: (\d+):(\d+):([\d.]+)", err)
+    vid = re.search(r"Stream.*Video:.*?(\d{2,5})x(\d{2,5})", err)
+    fps = re.search(r"([\d.]+) fps", err)
+    aud = re.search(r"Stream.*Audio:.*?(\d+) Hz, ([^,]+)", err)
+    ch_map = {"mono": 1, "stereo": 2, "5.1": 6, "5.1(side)": 6, "7.1": 8}
+    ch = 0
+    if aud:
+        lay = aud.group(2).strip()
+        ch = ch_map.get(lay) or int((re.match(r"(\d+) channels", lay) or [0, 2])[1])
+    return {
+        "duration": int(d[1]) * 3600 + int(d[2]) * 60 + float(d[3]) if d else 0.0,
+        "fps": round(float(fps[1]), 3) if fps else None,
+        "width": int(vid[1]) if vid else None,
+        "height": int(vid[2]) if vid else None,
+        "channels": ch,
+        "sample_rate": int(aud[1]) if aud else None,
+    }
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def proxy_paths(src: str, out_dir: str | None):
+    folder = out_dir or os.path.join(os.path.dirname(os.path.abspath(src)), PROXY_DIR)
+    name = os.path.splitext(os.path.basename(src))[0] + SUFFIX
+    return folder, os.path.join(folder, name + ".mp4"), os.path.join(folder, name + ".info.json")
+
+
+def make_proxy(src: str, args) -> str | None:
+    folder, dst, info_path = proxy_paths(src, args.out)
+    if os.path.exists(info_path) and not args.force:
+        print(f"[건너뜀] 이미 있음: {dst}")
+        return dst
+    os.makedirs(folder, exist_ok=True)
+
+    meta = probe(src)
+    if not meta["channels"]:
+        print(f"[경고] 오디오가 없는 파일이라 건너뜁니다: {src}")
+        return None
+    dur = meta["duration"]
+    print(f"\n[원본] {src}")
+    print(f"       {meta['width']}x{meta['height']}  {meta['fps']}fps  오디오 {meta['channels']}ch  길이 {dur / 60:.1f}분"
+          f"  크기 {human(os.path.getsize(src))}")
+
+    cmd = [FFMPEG, "-hide_banner", "-nostats", "-loglevel", "error", "-y", "-i", src,
+           "-map", "0:a:0", "-ac", "1", "-c:a", "aac", "-b:a", args.audio_bitrate]
+    if args.audio_only or meta["width"] is None:
+        dst_media = os.path.splitext(dst)[0] + ".m4a"
+        cmd += ["-vn"]
+    else:
+        dst_media = dst
+        cmd += ["-map", "0:v:0", "-vf", f"scale=-2:{args.height},fps={args.fps}",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", str(args.crf), "-pix_fmt", "yuv420p"]
+    cmd += ["-movflags", "+faststart", "-progress", "pipe:1", dst_media + ".part.mp4"]
+
+    t0 = time.time()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace")
+    for line in proc.stdout:
+        m = re.match(r"out_time_us=(\d+)", line)
+        if m and dur > 0:
+            done = int(m[1]) / 1e6
+            pct = min(100.0, 100 * done / dur)
+            speed = done / max(time.time() - t0, 0.01)
+            eta = (dur - done) / speed if speed > 0 else 0
+            bar = "#" * int(pct / 4)
+            print(f"\r       [{bar:<25}] {pct:5.1f}%  (남은 시간 약 {eta / 60:.1f}분)", end="", flush=True)
+    proc.wait()
+    print()
+    if proc.returncode != 0:
+        print(f"[실패] {src}\n{proc.stderr.read()}")
+        try:
+            os.remove(dst_media + ".part.mp4")
+        except OSError:
+            pass
+        return None
+    os.replace(dst_media + ".part.mp4", dst_media)
+
+    info = {
+        "source_path": os.path.abspath(src).replace("\\", "/"),
+        "source_fps": meta["fps"],
+        "source_width": meta["width"],
+        "source_height": meta["height"],
+        "source_channels": meta["channels"],
+        "source_sample_rate": meta["sample_rate"],
+        "source_duration": dur,
+        "proxy": os.path.basename(dst_media),
+    }
+    info_path = os.path.splitext(dst_media)[0] + ".info.json"
+    with open(info_path, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=1)
+
+    size = os.path.getsize(dst_media)
+    print(f"[완료] {dst_media}  ({human(size)}, {time.time() - t0:.0f}초 걸림)")
+    print(f"       같이 올릴 정보 파일: {info_path}")
+    return dst_media
+
+
+def collect(paths) -> list[str]:
+    files = []
+    for p in paths:
+        if os.path.isdir(p):
+            for name in sorted(os.listdir(p)):
+                full = os.path.join(p, name)
+                if os.path.isfile(full) and os.path.splitext(name)[1].lower() in VIDEO_EXT \
+                        and not os.path.splitext(name)[0].endswith(SUFFIX):
+                    files.append(full)
+        elif os.path.isfile(p):
+            files.append(p)
+        else:
+            print(f"[경고] 없는 경로: {p}")
+    return files
+
+
+def watch(folder: str, args):
+    """폴더 감시: 새 영상이 들어오고 복사가 끝나면(크기 변화 멈춤) 자동 변환"""
+    print(f"[감시] {folder} 에 영상이 들어오면 자동으로 사본을 만듭니다. (종료: Ctrl+C)")
+    sizes: dict[str, tuple[int, int]] = {}
+    while True:
+        for f in collect([folder]):
+            _, dst, info = proxy_paths(f, args.out)
+            if os.path.exists(info):
+                continue
+            try:
+                size = os.path.getsize(f)
+            except OSError:
+                continue
+            prev, stable = sizes.get(f, (-1, 0))
+            stable = stable + 1 if size == prev else 0
+            sizes[f] = (size, stable)
+            if stable >= 2:  # 10초 동안 크기 변화 없음 → 복사 완료로 판단
+                make_proxy(f, args)
+                sizes.pop(f, None)
+        time.sleep(5)
+
+
+def main():
+    global FFMPEG
+    p = argparse.ArgumentParser(description="분석용 저화질 사본(프록시)을 만듭니다. 시간축은 원본과 동일합니다.",
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("inputs", nargs="*", help="영상 파일 또는 폴더")
+    p.add_argument("--watch", metavar="폴더", help="폴더를 감시해서 새 영상을 자동 변환")
+    p.add_argument("--out", help="사본 저장 폴더 (기본: 원본 옆 proxy 폴더)")
+    p.add_argument("--height", type=int, default=360, help="사본 세로 해상도")
+    p.add_argument("--fps", type=float, default=5, help="사본 fps (분석에는 5면 충분)")
+    p.add_argument("--crf", type=int, default=32, help="화질 (클수록 작고 흐림)")
+    p.add_argument("--audio-bitrate", default="96k")
+    p.add_argument("--audio-only", action="store_true", help="소리만 저장 (가장 작음, 화면 멈춤 분석 불가)")
+    p.add_argument("--force", action="store_true", help="이미 사본이 있어도 다시 만듦")
+    p.add_argument("--pause", action="store_true", help=argparse.SUPPRESS)  # .bat 용: 끝나고 창 유지
+    args = p.parse_args()
+    FFMPEG = find_ffmpeg()
+
+    try:
+        if args.watch:
+            watch(args.watch, args)
+        files = collect(args.inputs)
+        if not files:
+            p.print_help()
+        results = [make_proxy(f, args) for f in files]
+        ok = [r for r in results if r]
+        if files:
+            print(f"\n총 {len(files)}개 중 {len(ok)}개 완료.")
+            if ok:
+                print("proxy 폴더의 *_proxy.mp4 와 *_proxy.info.json 을 함께 올려 주세요.")
+    except KeyboardInterrupt:
+        print("\n중단했습니다.")
+    finally:
+        if args.pause:
+            input("\n엔터를 누르면 창이 닫힙니다...")
+
+
+if __name__ == "__main__":
+    main()

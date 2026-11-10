@@ -64,7 +64,26 @@ python lecture_cut.py 강의.mp4
 
 원본은 업로드하지 않고, **저화질 사본으로 분석 → 원본 컷 정보(XML)만 프리미어로 가져오는** 방식입니다.
 
-### 1. 분석용 저화질 사본 만들기 (원본 PC에서)
+### 1. 분석용 저화질 사본 만들기 — `make_proxy.py` (자동)
+
+```bash
+pip install imageio-ffmpeg     # ffmpeg 가 없으면 이것만 설치하면 됨
+```
+
+| 방법 | 하는 법 |
+|---|---|
+| **끌어다 놓기 (Windows)** | 영상 파일(여러 개·폴더도 가능)을 `make_proxy.bat` 아이콘 위에 드래그 |
+| **폴더 감시 (Windows)** | `watch_folder.bat` 더블클릭 → 옆에 생긴 `원본` 폴더에 영상을 넣기만 하면 자동 변환 |
+| **폴더 감시 (Mac)** | `make_proxy.command` 더블클릭 → `원본` 폴더에 영상 넣기 |
+| 명령어 | `python make_proxy.py 강의.mp4` / `python make_proxy.py --watch D:/강의폴더` |
+
+원본 옆 `proxy` 폴더에 두 파일이 생깁니다. **둘 다 함께** 올려 주세요.
+- `강의_proxy.mp4` — 360p·5fps·모노 사본 (1시간 ≈ 수십 MB, 시간축은 원본과 동일)
+- `강의_proxy.info.json` — 원본 fps·해상도·채널·경로. `lecture_cut.py` 가 자동으로 읽으므로 아래 2단계의 `--timeline-fps` 등을 입력할 필요가 없음
+
+그래도 크면 `--audio-only` (소리만, 화면 멈춤 분석만 불가) 또는 `--height 240 --crf 36`.
+
+#### 직접 만들 때 (참고)
 
 시간축만 같으면 되므로 해상도·fps를 크게 낮춰도 됩니다. 1시간 강의 기준 수십 MB 정도로 줄어듭니다.
 
@@ -76,6 +95,12 @@ ffmpeg -i lecture01.mp4 -vf "scale=-2:360,fps=5" -c:v libx264 -crf 32 -preset ve
 **앞뒤를 자르지 말고 전체를 그대로** 내보내야 시간이 맞습니다.
 
 ### 2. 분석해서 프리미어용 XML 만들기
+
+```bash
+python lecture_cut.py proxy/lecture01_proxy.mp4 --premiere
+```
+
+`make_proxy.py` 로 만든 사본이면 이걸로 끝입니다. 직접 만든 사본이면 원본 정보를 알려줘야 합니다:
 
 ```bash
 python lecture_cut.py lecture01_proxy.mp4 --premiere --timeline-fps 29.97 --source-size 1920x1080 --source-path "D:/강의/lecture01.mp4"
