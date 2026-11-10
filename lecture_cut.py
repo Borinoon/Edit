@@ -906,7 +906,8 @@ def main():
     g = p.add_argument_group("프리미어 프로로 내보내기 (원본은 그대로, 컷 정보만)")
     g.add_argument("--premiere", action="store_true",
                    help="영상을 렌더링하지 않고 프리미어용 XML(+컷 목록 CSV)만 만든다")
-    g.add_argument("--no-noise", action="store_true", help="쿵·딸깍 같은 노이즈 표시 끄기")
+    g.add_argument("--noise", action="store_true",
+                   help="(실험) 키보드·클릭 노이즈 표시 켜기. 실제 강의 검수에서 오탐이 많아 기본은 꺼짐")
     g.add_argument("--noise-sensitivity", type=float, default=0.0, help="노이즈 감지 민감도(dB). +면 더 많이, -면 덜")
     g.add_argument("--thump", action="store_true", help="(실험) 쿵 같은 저음 충격도 노이즈로 표시")
     g.add_argument("--auto-cut-xml", action="store_true", help="라벨 표시 XML 외에 실제로 잘라낸 자동컷 XML도 만들기")
@@ -1030,7 +1031,7 @@ def main():
 
     if args.premiere:
         cuts = describe_cuts(keep, dur, words, energy)
-        noises = [] if args.no_noise else detect_noise(samples, sr, energy, words, args.noise_sensitivity,
+        noises = [] if not args.noise else detect_noise(samples, sr, energy, words, args.noise_sensitivity,
                                                        thump=args.thump)
         if args.source_size:
             w_, h_ = (int(x) for x in args.source_size.lower().split("x"))

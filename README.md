@@ -136,7 +136,7 @@ curl -fsSL https://raw.githubusercontent.com/Borinoon/Edit/claude/compassionate-
 | 주황 (Mango) | 필러 (uh, um) |
 | 파랑 (Cerulean) | 침묵·숨소리 (자연스러운 쉼은 남기고 나머지) |
 | 노랑 (Yellow) | 확인 필요 — "sorry, I mean" 같은 말 정정 (후보 아님, 직접 판단) |
-| 초록 (Forest) | 노이즈 — 쿵, 딸깍 (자동 감지, 들어보고 판단) |
+| 초록 (Forest) | 노이즈 — 기본 꺼짐 (`--noise` 로 켜기, 오탐 많음) |
 
 프리미어에서 라벨 색으로 선택(클립 우클릭 > 레이블 > 레이블 그룹 선택) 후 리플 삭제하면 한 번에 잘라낼 수 있습니다.
 실제로 잘라낸 버전도 필요하면 `--auto-cut-xml`.
