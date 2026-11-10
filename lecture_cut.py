@@ -207,15 +207,16 @@ FILLER_PROMPTS = {
 }
 
 
-def transcribe(wav: str, model_name: str, device: str, compute_type: str, language: str) -> list[Word]:
+def transcribe(audio, model_name: str, device: str, compute_type: str, language: str) -> list[Word]:
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         sys.exit("faster-whisper가 필요합니다:  pip install faster-whisper   (또는 --no-asr 사용)")
     print(f"[ASR] 모델 로드: {model_name} ({device}/{compute_type})", flush=True)
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    # 파일 경로 대신 16kHz float 배열을 넘긴다 (PyAV 버전 차이로 인한 디코딩 오류 회피)
     segments, info = model.transcribe(
-        wav,
+        audio,
         language=language or None,
         word_timestamps=True,
         initial_prompt=FILLER_PROMPTS.get(language or "", FILLER_PROMPTS["en"]),
@@ -754,7 +755,7 @@ def main():
                 with open(cache, encoding="utf-8") as f:
                     words = [Word(**{k: d[k] for k in ("start", "end", "text", "prob")}) for d in json.load(f)]
             else:
-                words = transcribe(wav, args.model, args.device, args.compute_type, args.language)
+                words = transcribe(samples, args.model, args.device, args.compute_type, args.language)
                 with open(cache, "w", encoding="utf-8") as f:
                     json.dump([asdict(w) for w in words], f, ensure_ascii=False, indent=0)
             if not args.no_fillers:
