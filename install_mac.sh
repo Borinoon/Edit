@@ -95,15 +95,16 @@ cat > "$PLIST" <<PLIST
   <key>Label</key><string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${VENV}/bin/python</string>
-    <string>-u</string>
-    <string>${APP}/make_proxy.py</string>
+    <string>/bin/bash</string>
+    <string>${APP}/run_watch.sh</string>
     <string>--watch</string>
     <string>${WATCH}</string>
     <string>--analyze</string>
     <string>--results</string>
     <string>${RESULTS}</string>
     <string>--notify</string>
+    <string>--restart-hours</string>
+    <string>6</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -141,7 +142,8 @@ cat <<DONE
       *_컷목록.csv 는 표시한 구간 목록 (엑셀)
    30분 강의 기준 10~30분 걸립니다.
 
- - Mac 을 껐다 켜도 자동으로 감시합니다.
+ - Mac 을 껐다 켜도 자동으로 감시합니다. 프로그램은 자동으로 최신 버전으로 업데이트됩니다.
+ - 진행 상황: 바탕화면 "강의 XML/진행상황.txt"
  - 진행 기록: $LOG
  - 삭제: bash $APP/uninstall_mac.sh
 ==============================================================

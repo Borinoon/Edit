@@ -246,6 +246,8 @@ def analyze(src: str, args) -> bool:
            src, "--premiere", "--out-dir", out, "--model", args.model]
     if not args.no_motion:
         cmd.append("--keep-silent-motion")
+    if sys.platform == "darwin" and shutil.which("caffeinate"):
+        cmd = ["caffeinate", "-i"] + cmd  # 처리 중에는 Mac 이 잠자기로 들어가지 않게
     t0 = time.time()
     ok = subprocess.run(cmd).returncode == 0 and os.path.exists(os.path.join(out, stem + "_라벨표시.xml"))
     mins = (time.time() - t0) / 60
@@ -267,15 +269,43 @@ def is_done(f: str, args) -> bool:
     return os.path.exists(proxy_paths(f, args.out)[2])
 
 
+def write_status(folder: str, args, states: dict[str, str]):
+    """결과 폴더에 '진행상황.txt' — 어떤 영상이 완료/진행 중/대기/실패인지 한눈에"""
+    target = args.results or os.path.join(folder, "편집결과")
+    try:
+        os.makedirs(target, exist_ok=True)
+        lines = [f"업데이트: {time.strftime('%Y-%m-%d %H:%M:%S')}", ""]
+        order = {"진행 중": 0, "실패": 1, "대기": 2, "완료": 3}
+        for f, st in sorted(states.items(), key=lambda kv: (order.get(kv[1].split()[0], 9), kv[0])):
+            lines.append(f"[{st}] {os.path.relpath(f, folder)}")
+        with open(os.path.join(target, "진행상황.txt"), "w", encoding="utf-8") as fp:
+            fp.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
 def watch(folder: str, args):
-    """폴더 감시: 새 영상이 들어오고 복사가 끝나면(크기 변화 멈춤) 자동 처리"""
+    """폴더 감시: 새 영상이 들어오고 복사가 끝나면(크기 변화 멈춤) 하나씩 자동 처리"""
     what = "프리미어용 자동 편집(XML)을" if args.analyze else "저화질 사본을"
     print(f"[감시] {folder} 에 영상이 들어오면 자동으로 {what} 만듭니다. (종료: Ctrl+C)", flush=True)
     sizes: dict[str, tuple[int, int]] = {}
-    failed: set[str] = set()
+    failed: dict[str, tuple[int, float]] = {}  # 파일 → (실패 횟수, 마지막 실패 시각)
+    MAX_TRY, RETRY_AFTER = 3, 600
+    started = time.time()
     while True:
-        for f in collect([folder], recursive=True):
-            if f in failed or is_done(f, args):
+        files = collect([folder], recursive=True)
+        states = {}
+        todo = None
+        for f in files:
+            if is_done(f, args):
+                states[f] = "완료"
+                continue
+            n, t = failed.get(f, (0, 0.0))
+            if n >= MAX_TRY:
+                states[f] = f"실패 {n}회 — log.txt 확인, 파일을 다시 넣으면 재시도"
+                continue
+            if n and time.time() - t < RETRY_AFTER:
+                states[f] = f"실패 {n}회 — {int((RETRY_AFTER - (time.time() - t)) / 60) + 1}분 뒤 재시도"
                 continue
             try:
                 size = os.path.getsize(f)
@@ -284,11 +314,29 @@ def watch(folder: str, args):
             prev, stable = sizes.get(f, (-1, 0))
             stable = stable + 1 if size == prev else 0
             sizes[f] = (size, stable)
-            if stable >= 2:  # 10초 동안 크기 변화 없음 → 복사 완료로 판단
-                ok = analyze(f, args) if args.analyze else make_proxy(f, args)
-                if not ok:
-                    failed.add(f)  # 실패한 파일은 다시 넣거나 프로그램을 재시작할 때까지 건너뜀
-                sizes.pop(f, None)
+            states[f] = "대기" if stable >= 2 else "대기 (복사 중)"
+            if stable >= 2 and todo is None:  # 10초 동안 크기 변화 없음 → 복사 완료
+                todo = f
+        # 다시 넣은 파일(크기·시각이 바뀜)은 실패 기록을 지운다
+        for f in list(failed):
+            if f not in files:
+                failed.pop(f)
+        if todo:
+            states[todo] = "진행 중"
+            write_status(folder, args, states)
+            ok = analyze(todo, args) if args.analyze else make_proxy(todo, args)
+            if ok:
+                failed.pop(todo, None)
+            else:
+                n, _ = failed.get(todo, (0, 0.0))
+                failed[todo] = (n + 1, time.time())
+            sizes.pop(todo, None)
+            continue  # 바로 다음 파일로
+        write_status(folder, args, states)
+        if args.restart_hours and time.time() - started > args.restart_hours * 3600:
+            # 할 일이 없을 때 주기적으로 종료 → 자동 재시작되면서 최신 버전으로 업데이트 (run_watch.sh)
+            print("[감시] 업데이트 확인을 위해 재시작합니다.", flush=True)
+            sys.exit(0)
         time.sleep(5)
 
 
@@ -309,6 +357,7 @@ def main():
     p.add_argument("--results", help="--analyze 결과 폴더 (기본: 원본 옆 '편집결과')")
     p.add_argument("--model", default="medium", help="--analyze 음성 인식 모델")
     p.add_argument("--no-motion", action="store_true", help="--analyze 시 말 없이 화면이 움직이는 구간도 자름")
+    p.add_argument("--restart-hours", type=float, default=0, help=argparse.SUPPRESS)
     p.add_argument("--notify", action="store_true", help="완료/실패 시 Mac 알림 표시")
     p.add_argument("--force", action="store_true", help="이미 사본이 있어도 다시 만듦")
     p.add_argument("--pause", action="store_true", help=argparse.SUPPRESS)  # .bat 용: 끝나고 창 유지
