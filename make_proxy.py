@@ -116,6 +116,14 @@ def proxy_paths(src: str, out_dir: str | None):
     return folder, os.path.join(folder, name + ".mp4"), os.path.join(folder, name + ".info.json")
 
 
+def notify(title: str, msg: str):
+    """Mac 알림 센터 알림 (백그라운드 감시 중에도 완료를 알 수 있게)"""
+    if sys.platform == "darwin":
+        msg, title = msg.replace('"', "'"), title.replace('"', "'")
+        subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "{title}"'],
+                       capture_output=True)
+
+
 def make_proxy(src: str, args) -> str | None:
     folder, dst, info_path = proxy_paths(src, args.out)
     if os.path.exists(info_path) and not args.force:
@@ -159,6 +167,10 @@ def make_proxy(src: str, args) -> str | None:
     print()
     if proc.returncode != 0:
         print(f"[실패] {src}\n{proc.stderr.read()}")
+        if args.notify:
+            notify("강의 사본 실패", os.path.basename(src))
+        if args.notify:
+            notify("강의 사본 실패", os.path.basename(src))
         try:
             os.remove(dst_media + ".part.mp4")
         except OSError:
@@ -182,6 +194,8 @@ def make_proxy(src: str, args) -> str | None:
 
     size = os.path.getsize(dst_media)
     print(f"[완료] {dst_media}  ({human(size)}, {time.time() - t0:.0f}초 걸림)")
+    if args.notify:
+        notify("강의 사본 완료", f"{os.path.basename(dst_media)} ({human(size)})")
     print(f"       같이 올릴 정보 파일: {info_path}")
     return dst_media
 
@@ -236,6 +250,7 @@ def main():
     p.add_argument("--crf", type=int, default=32, help="화질 (클수록 작고 흐림)")
     p.add_argument("--audio-bitrate", default="96k")
     p.add_argument("--audio-only", action="store_true", help="소리만 저장 (가장 작음, 화면 멈춤 분석 불가)")
+    p.add_argument("--notify", action="store_true", help="완료/실패 시 Mac 알림 표시")
     p.add_argument("--force", action="store_true", help="이미 사본이 있어도 다시 만듦")
     p.add_argument("--pause", action="store_true", help=argparse.SUPPRESS)  # .bat 용: 끝나고 창 유지
     args = p.parse_args()

@@ -3,6 +3,12 @@
 # 영상을 "원본" 폴더에 넣으면 자동으로 "원본/proxy" 에 저화질 사본이 생깁니다.
 cd "$(dirname "$0")" || exit 1
 
+# install_mac.sh 로 설치했다면 그 환경을 사용
+if [ -x "$HOME/LectureCut/venv/bin/python" ]; then
+  mkdir -p "원본"; open "원본"
+  exec "$HOME/LectureCut/venv/bin/python" make_proxy.py --watch "원본" --notify
+fi
+
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 가 없습니다. https://www.python.org/downloads/ 에서 설치한 뒤 다시 실행하세요."
   read -r -p "엔터를 누르면 닫힙니다..."
